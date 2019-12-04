@@ -241,33 +241,33 @@ instance PP (Exp a) where
      [ line' $ pp d <> " := " <> pp s <> ";"
      , pp e
      ]
-   ARec _ fs e -> undefined
-   ACase _ e d pes -> undefined
+   ARec _ fs e -> undefined -- TODO
+   ACase _ e d pes -> undefined -- TODO
 
 -- -------------------- Variables --------------------
 
 -- Generic fold over variables
 foldVars :: Monoid m => (Var -> m) -> Exp a -> m
 foldVars f = \case
-  (_, Var x) -> f x
-  (_, Int _ _) -> mempty
-  (_, Unreachable) -> mempty
-  (_, Tuple es) -> foldMap (foldVars f) es
-  (_, Update e1 _ e2) -> foldVars f e1 <> foldVars f e2
-  (_, Proj e _) -> foldVars f e
-  (_, Elem e1 e2) -> foldVars f e1 <> foldVars f e2
-  (_, ElemV e1 e2) -> foldVars f e1 <> foldVars f e2
-  (_, Coerce e _) -> foldVars f e
-  (_, Binop e1 _ e2) -> foldVars f e1 <> foldVars f e2
-  (_, Let x _ e1 e) -> f x <> foldVars f e1 <> foldVars f e
-  (_, Call e es) -> foldVars f e <> foldMap (foldVars f) es
-  (_, Addr e) -> foldVars f e
-  (_, Load e) -> foldVars f e
-  (_, Store d s e) -> foldVars f d <> foldVars f s <> foldVars f e
-  (_, Rec fs e) ->
-    foldMap (\ (_, Helper f' xts _ e) -> f f' <> foldMap (f . fst) xts <> foldVars f e) fs <>
+  AVar a x -> f x
+  AInt a _ _ -> mempty
+  AUnreachable a -> mempty
+  ATuple a es -> foldMap (foldVars f) es
+  AUpdate a e1 _ e2 -> foldVars f e1 <> foldVars f e2
+  AProj a e _ -> foldVars f e
+  AElem a e1 e2 -> foldVars f e1 <> foldVars f e2
+  AElemV a e1 e2 -> foldVars f e1 <> foldVars f e2
+  ACoerce a e _ -> foldVars f e
+  ABinop a e1 _ e2 -> foldVars f e1 <> foldVars f e2
+  ALet a x _ e1 e -> f x <> foldVars f e1 <> foldVars f e
+  ACall a e es -> foldVars f e <> foldMap (foldVars f) es
+  AAddr a e -> foldVars f e
+  ALoad a e -> foldVars f e
+  AStore a d s e -> foldVars f d <> foldVars f s <> foldVars f e
+  ARec a fs e ->
+    foldMap (\ (AHelper _ f' xts _ e) -> f f' <> foldMap (f . fst) xts <> foldVars f e) fs <>
     foldVars f e
-  (_, Case e d pes) ->
+  ACase a e d pes ->
     foldVars f e <> foldVars f d <> foldMap (\ (_ :=> e) -> foldVars f e) pes
 
 -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
