@@ -116,41 +116,6 @@ data Loc = Loc
   , locCol :: Int
   } deriving (Eq, Ord, Show)
 
---  Syntax                               Restrictions         LLVM counterpart
---  p ∈ primitive type
---    = i1 | i2 | ..
---    | half | float | double | fp128
---    | t*
---  t ∈ type
---    = p
---    | void
---    | <n x p>                          n > 0
---    | [n x t]
---    | {t, ..}
---  e ∈ expr
---    = x                                Identifier
---    | true | false
---    | 0 | 1 | ..
---    | 'a' | 'b' | ..
---    | "" | "a" | ..
---    | null
---    | none
---    | unreachable
---    | {e, ..}
---    | e {n.m... = e}                                        updatevalue
---    | e.n                                                   extractvalue
---    | e[e]                                                  extractvalue
---    | e<e>                                                  extractelement
---    | e as t                                                bitcast, sext, strunc, ..
---    | e + e | e * e | ..
---    | let x = e in e
---    | e(e, ..)                                              call, tail call
---    | &e                                                    getelementptr
---    | *e                                                    load
---    | e := e; e                                             store
---    | rec f(x, ..) = e and .. in e     Tail calls only      Labelled blocks + phi nodes
---    | case e {n => e, .., n => e}                           switch
-
 -- -- -------------------- Utils --------------------
 -- 
 -- for :: [a] -> (a -> b) -> [b]
@@ -277,6 +242,7 @@ data TCErr
   = NotInScope Var
   | ExGotShape String Ty
   | ExGot Ty Ty
+  | BadPath [Field]
   | Custom String
 
 type TC = ExceptT (Loc, TCErr) (Reader (Map Var Ty))
@@ -286,18 +252,22 @@ var a x = (M.!? x) <$> ask >>= \case
   Just ty -> return $ AVar (ty, a) x
   Nothing -> raise a $ NotInScope x
 
+pattern AnnTy e ty <- ((\ x -> (x, x)) -> (e, Anno (ty, _)))
+pattern AnnoTy ty <- Anno (ty, _)
+
 check :: Has Loc a => Exp a -> Ty -> TC (Exp (Ty, a))
 check exp ty = case exp of
   AUnreachable a -> return $ AUnreachable (ty, a)
-  AUpdate a e1 _ e2 -> undefined
-  ABinop a e1 _ e2 -> undefined
-  ARec a fs e -> undefined
   ACase a e d pes -> infer e >>= \case
-    e'@(Anno (Prim (I _), _)) ->
+    AnnTy e' (Prim (I _)) ->
       ACase (ty, a) e'
         <$> check d ty
         <*> mapM (\ (p :=> e) -> (p :=>) <$> check e ty) pes
-    Anno (ty, _) -> raise a $ ExGotShape "integer" ty
+    AnnoTy ty -> raise a $ ExGotShape "integer" ty
+  exp@(Anno a) -> infer exp >>= \case
+    AnnTy exp' ty'
+      | ty' == ty -> return exp'
+      | otherwise -> raise a $ ExGot ty ty'
 
 infer :: Has Loc a => Exp a -> TC (Exp (Ty, a))
 infer = \case
@@ -305,43 +275,53 @@ infer = \case
   AInt a i w -> return $ AInt (Prim (I w), a) i w
   ATuple a es -> do
     es' <- mapM infer es
-    return $ ATuple (Tup (map (\ (Anno (t, _)) -> t) es'), a) es'
-  AUpdate a e1 _ e2 -> undefined
+    return $ ATuple (Tup (map (\ (AnnoTy t) -> t) es'), a) es'
+  AUpdate a e1 _ e2 -> undefined -- TODO
   AProj a e n -> infer e >>= \case
-    e'@(Anno (Tup ts, _))
+    AnnTy e' (Tup ts)
       | n < L.genericLength ts -> return $ AProj (ts!!fromIntegral n, a) e' n
-      | otherwise -> raise a . Custom $ "tuple has no " ++ show n ++ "th element"
-    Anno (ty, _) -> raise a $ ExGotShape "tuple" ty
+      | otherwise -> raise a $ BadPath [n]
+    AnnoTy ty -> raise a $ ExGotShape "tuple" ty
   AElem a e1@(Anno a1) e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
-    (e1'@(Anno (Arr _ t, _)), e2'@(Anno (Prim (I _), _))) -> return $ AElem (t, a) e1' e2'
-    (Anno (Arr _ _, _), Anno (ty, _)) -> raise a2 $ ExGotShape "integer" ty
-    (Anno (ty, _), _) -> raise a1 $ ExGotShape "array" ty
+    (AnnTy e1' (Arr _ t), AnnTy e2' (Prim (I _))) -> return $ AElem (t, a) e1' e2'
+    (AnnoTy (Arr _ _), AnnoTy ty) -> raise a2 $ ExGotShape "integer" ty
+    (AnnoTy ty, _) -> raise a1 $ ExGotShape "array" ty
   AElemV a e1@(Anno a1) e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
-    (e1'@(Anno (Vec _ t, _)), e2'@(Anno (Prim (I _), _))) -> return $ AElemV (Prim t, a) e1' e2'
-    (Anno (Vec _ _, _), Anno (ty, _)) -> raise a2 $ ExGotShape "integer" ty
-    (Anno (ty, _), _) -> raise a1 $ ExGotShape "vector" ty
+    (AnnTy e1' (Vec _ t), AnnTy e2' (Prim (I _))) -> return $ AElemV (Prim t, a) e1' e2'
+    (AnnoTy (Vec _ _), AnnoTy ty) -> raise a2 $ ExGotShape "integer" ty
+    (AnnoTy ty, _) -> raise a1 $ ExGotShape "vector" ty
   ACoerce a e t -> ACoerce (t, a) <$> infer e <*> pure t
-  ABinop a e1 o e2 -> undefined
+  ABinop a e1 o e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
+    (AnnTy e1' t1, AnnTy e2' t2)
+      | t1 == t2 -> return $ ABinop (t1, a) e1' o e2'
+      | otherwise -> raise a2 $ ExGot t1 t2
   ALet a x t e1 e -> do
     e1' <- check e1 t
-    e'@(Anno (ty, _)) <- local (M.insert x t) (infer e)
+    AnnTy e' ty <- local (M.insert x t) (infer e)
     return $ ALet (ty, a) x t e1' e'
   ACall a e es -> infer e >>= \case
-    e'@(Anno (Fun ts t, _)) -> ACall (t, a) e' <$> zipWithM check es ts
-    Anno (ty, _) -> raise a $ ExGotShape "function" ty
+    AnnTy e' (Fun ts t) -> ACall (t, a) e' <$> zipWithM check es ts
+    AnnoTy ty -> raise a $ ExGotShape "function" ty
   AAddr a e -> do
-    e'@(Anno (t, _)) <- infer e
+    AnnTy e' t <- infer e
     return $ AAddr (Prim (Ptr t), a) e'
   ALoad a e -> infer e >>= \case
-    e'@(Anno (Prim (Ptr t), _)) -> return $ ALoad (t, a) e'
-    Anno (ty, _) -> raise a $ ExGotShape "pointer" ty
+    AnnTy e' (Prim (Ptr t)) -> return $ ALoad (t, a) e'
+    AnnoTy ty -> raise a $ ExGotShape "pointer" ty
   AStore a d s e -> infer d >>= \case
-    d'@(Anno (Prim (Ptr t), _)) -> do
+    AnnTy d' (Prim (Ptr t)) -> do
       s' <- check s t
-      e'@(Anno (ty, _)) <- infer e
+      AnnTy e' ty <- infer e
       return $ AStore (ty, a) d' s' e'
-    Anno (ty, _) -> raise a $ ExGotShape "pointer" ty
-  ARec a fs e -> undefined
+    AnnoTy ty -> raise a $ ExGotShape "pointer" ty
+  ARec a helpers e -> do
+    let fs = map (\ (AHelper _ f _ _ _) -> f) helpers
+    let ts = map (\ (AHelper _ _ xts t _) -> Fun (map snd xts) t) helpers
+    local (M.union . M.fromList $ zip fs ts) $ do
+      helpers' <- forM helpers $ \ (AHelper a f xts t e) ->
+        AHelper (Void, a) f xts t <$> local (M.union $ M.fromList xts) (check e t)
+      AnnTy e' ty <- infer e
+      return $ ARec (ty, a) helpers' e'
 
 -- -------------------- Code formatting utils --------------------
 
