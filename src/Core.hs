@@ -4,7 +4,7 @@ import qualified Data.List as L
 import Data.Set (Set, (\\)); import qualified Data.Set as S
 import Data.Map.Strict (Map); import qualified Data.Map.Strict as M
 import Data.Semigroup
--- import qualified Data.Foldable as F
+import qualified Data.Foldable as F
 -- import Data.Bifunctor
 import Data.Functor
 -- import Data.Functor.Foldable
@@ -149,6 +149,101 @@ proj :: Has t tup => tup -> t; proj = π
 raise :: (Has Loc a, MonadError (Loc, e) m) => a -> e -> m r
 raise a e = throwError (π a, e)
 
+-- -------------------- Doc formatting utils --------------------
+
+type Str = DList Char -- For efficient catenation
+
+-- Indentation as input
+type Doc = Reader Str Str
+deriving instance Semigroup a => Semigroup (Reader r a)
+deriving instance Monoid a => Monoid (Reader r a)
+
+show' :: Show a => a -> Str
+show' = D.fromList . show
+
+show'' :: Show a => a -> Doc
+show'' = pure . show'
+
+runDoc :: Doc -> String
+runDoc c = D.toList $ c `runReader` ""
+
+instance IsString Doc where fromString = pure . D.fromList
+
+indent :: Doc -> Doc
+indent = local ("  " <>)
+
+line :: Str -> Doc
+line l = reader $ \ s -> s <> l <> "\n"
+
+line' :: Doc -> Doc
+line' l = reader $ \ s -> s <> runReader l s <> "\n"
+
+calate :: Doc -> [Doc] -> Doc
+calate sep ds = F.fold (L.intersperse sep ds)
+
+commaSep :: [Doc] -> Doc
+commaSep = calate ", "
+
+class PP a where pp :: a -> Doc
+
+instance PP PTy where
+  pp = \case
+    I w -> "i" <> show'' w
+    Half -> "half"
+    Float -> "float"
+    Double -> "double"
+    FP128 -> "FP128"
+    Ptr t -> pp t <> "*"
+
+instance PP Ty where
+  pp = \case
+    Void -> "void"
+    Prim t -> pp t
+    Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
+    Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
+    Tup ts -> "{" <> commaSep (map pp ts) <> "}"
+    Fun ts t -> "((" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
+
+instance PP (Helper a) where
+  pp (Helper f xts t e) =
+    let xts' = map (\ (x, t) -> show'' x <> ": " <> pp t) xts in
+    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " =" <> indent (pp e)
+
+instance PP Binop where
+  pp = \case
+    Add -> "+"
+    Mul -> "*"
+    Sub -> "-"
+    Div -> "/"
+
+instance PP (Exp a) where
+  pp = \case
+   AVar _ x -> show'' x
+   AInt _ i w -> show'' i <> "i" <> show'' w
+   AUnreachable _ -> "unreachable"
+   ATuple _ es -> "{" <> commaSep (map pp es) <> "}"
+   AUpdate _ e1 p e2 -> pp e1 <> " {" <> calate "." (show'' <$> p) <> " = " <> pp e2 <> "}"
+   AProj _ e n -> pp e <> "." <> show'' n
+   AElem _ e1 e2 -> pp e1 <> "[" <> pp e2 <> "]"
+   AElemV _ e1 e2 -> pp e1 <> "<" <> pp e2 <> ">"
+   ACoerce _ e t -> pp e <> " as " <> pp t
+   ABinop _ e1 o e2 -> "(" <> pp e1 <> " " <> pp o <> " " <> pp e2 <> ")"
+   ALet _ x t e1 e -> F.fold
+     [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
+     , indent (pp e1)
+     , line $ " in "
+     , pp e
+     ]
+   ACall _ e es -> pp e <> "(" <> commaSep (map pp es) <> ")"
+   AAddr _ e -> "&" <> pp e
+   ALoad _ e -> "*" <> pp e
+   AStore _ d s e -> F.fold
+     [ line' $ pp d <> " := " <> pp s <> ";"
+     , pp e
+     ]
+   ARec _ fs e -> undefined
+   ACase _ e d pes -> undefined
+
 -- -------------------- Variables --------------------
 
 -- Generic fold over variables
@@ -245,6 +340,15 @@ data TCErr
   | BadPath [Field]
   | Custom String
 
+instance PP TCErr where
+  pp = \case
+    NotInScope x -> line $ "Variable not in scope: " <> show' x
+    ExGotShape shape ty ->
+      line' $ "Expected " <> pure (D.fromList shape) <> " but got " <> pp ty
+    ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
+    BadPath p -> line $ "Bad path: " <> F.fold (L.intersperse "." (show' <$> p))
+    Custom s -> line $ D.fromList s
+
 type TC = ExceptT (Loc, TCErr) (Reader (Map Var Ty))
 
 var :: Has Loc a => a -> Var -> TC (Exp (Ty, a))
@@ -323,38 +427,9 @@ infer = \case
       AnnTy e' ty <- infer e
       return $ ARec (ty, a) helpers' e'
 
--- -------------------- Code formatting utils --------------------
-
-type Str = DList Char -- For efficient catenation
-
--- Indentation as input
-type Code = Reader Str Str
-deriving instance Semigroup a => Semigroup (Reader r a)
-deriving instance Monoid a => Monoid (Reader r a)
-
-show' :: Show a => a -> Str
-show' = D.fromList . show
-
-show'' :: Show a => a -> Code
-show'' = pure . show'
-
-runCode :: Code -> String
-runCode c = D.toList $ c `runReader` ""
-
-instance IsString Code where fromString = pure . D.fromList
-
-indent :: Code -> Code
-indent = local ("  " <>)
-
-line :: Str -> Code
-line l = reader $ \ s -> s <> l <> "\n"
-
-line' :: Code -> Code
-line' l = reader $ \ s -> s <> runReader l s <> "\n"
-
--- -- -------------------- Code generation utils --------------------
+-- -- -------------------- Doc generation utils --------------------
 -- 
--- varG :: Var -> Code
+-- varG :: Var -> Doc
 -- varG x = (M.! x) . fst <$> ask >>= \case
 --   Rbx -> pure "rbx"
 --   R12 -> pure "r12"
@@ -363,12 +438,12 @@ line' l = reader $ \ s -> s <> runReader l s <> "\n"
 --   R15 -> pure "r15"
 --   Spill n -> pure $ "spill" <> show' n
 -- 
--- declG :: Str -> Var -> Code
+-- declG :: Str -> Var -> Doc
 -- declG ty x = (M.! x) . fst <$> ask >>= \case
 --   Spill _ -> pure ty <> " " <> varG x
 --   _ -> varG x
 -- 
--- procG :: Code -> Code -> Code
+-- procG :: Doc -> Doc -> Doc
 -- procG name body = F.fold
 --   [ line' ("void " <> name <> "(void) {")
 --   , indent body
@@ -376,7 +451,7 @@ line' l = reader $ \ s -> s <> runReader l s <> "\n"
 --   , line "}"
 --   ]
 -- 
--- spillProcG :: Set Var -> Code -> Code -> Code
+-- spillProcG :: Set Var -> Doc -> Doc -> Doc
 -- spillProcG spilled name body = procG name $ F.fold
 --   [ line "gt_ch *rsp = (gt_ch *)gt_self()->rsp + 1;"
 --   , F.fold . for2 [0..] (S.toAscList spilled) $ \ offset x ->
@@ -384,7 +459,7 @@ line' l = reader $ \ s -> s <> runReader l s <> "\n"
 --   , body
 --   ]
 -- 
--- mainG :: Code -> Code
+-- mainG :: Doc -> Doc
 -- mainG body = F.fold
 --   [ line "int main(void) {"
 --   , indent $ F.fold
@@ -395,39 +470,39 @@ line' l = reader $ \ s -> s <> runReader l s <> "\n"
 --   , line "}"
 --   ]
 -- 
--- -- -------------------- Code generation --------------------
+-- -- -------------------- Doc generation --------------------
 -- 
 -- type Gen =
 --   ReaderT Alloc -- Result of allocation
 --   (StateT Word64 -- Fresh names for helper functions
---   (Writer Code)) -- Maintain helper functions generated along the way
+--   (Writer Doc)) -- Maintain helper functions generated along the way
 -- 
 -- gensym :: Str -> Gen Str
 -- gensym name = ("var_" <>) . (name <>) . show' <$> get <* modify' succ
 -- 
--- newG :: Var -> Code
+-- newG :: Var -> Doc
 -- newG x = line' $ declG "gt_ch" x <> " = gt_chan();"
 -- 
--- sendG :: Var -> Var -> Code
+-- sendG :: Var -> Var -> Doc
 -- sendG s d = line' $ "gt_write(" <> varG d <> ", " <> varG s <> ");"
 -- 
--- recvG :: Var -> Var -> Code
+-- recvG :: Var -> Var -> Doc
 -- recvG d s = line' $ declG "gt_ch" d <> " = gt_read(" <> varG s <> ");"
 -- 
--- foreignExpG :: ForeignExp -> Code
+-- foreignExpG :: ForeignExp -> Doc
 -- foreignExpG = \case
 --   Atom x -> varG x
 --   Call f xs ->
 --     pure (D.fromList f) <> "(" <>
 --       F.fold (L.intersperse "," (foreignExpG <$> xs)) <> ")"
 -- 
--- evalG :: Var -> ForeignExp -> Code
+-- evalG :: Var -> ForeignExp -> Doc
 -- evalG x e = line' $ declG "gt_ch" x <> " = " <> foreignExpG e <> ";"
 -- 
--- doG :: ForeignExp -> Code
+-- doG :: ForeignExp -> Doc
 -- doG e = line' $ foreignExpG e <> ";"
 -- 
--- bothG :: AnnProcess -> Set Var -> AnnProcess -> Gen Code
+-- bothG :: AnnProcess -> Set Var -> AnnProcess -> Gen Doc
 -- bothG p qs q = do
 --   f <- gensym "f"
 --   t <- gensym "t"
@@ -471,7 +546,7 @@ line' l = reader $ \ s -> s <> runReader l s <> "\n"
 --       Evals True _ -> 0x100000 + spillSize spilled
 --       Evals False _ -> 0x100 + spillSize spilled
 -- 
--- gen :: AnnProcess -> Gen Code
+-- gen :: AnnProcess -> Gen Doc
 -- gen = \case
 --   AHalt _ -> pure ""
 --   ANew _ x p -> (newG x <>) <$> gen p
@@ -512,16 +587,16 @@ line' l = reader $ \ s -> s <> runReader l s <> "\n"
 --     tell . foldMap (line . D.fromList) $ lines body
 --     gen p
 -- 
--- genTop :: AnnProcess -> Gen Code
+-- genTop :: AnnProcess -> Gen Doc
 -- genTop (FV vs p) = do
 --   tell $ line "#include <stdlib.h>"
 --   tell $ line "#include \"runtime.c\""
 --   mainG <$> gen (ABoth (vs, Any False) (AHalt (S.empty, Any False)) p)
 -- 
--- runGen :: Alloc -> Gen Code -> String
+-- runGen :: Alloc -> Gen Doc -> String
 -- runGen alloc m =
 --   let (main, helpers) = runWriter $ m `runReaderT` alloc `evalStateT` 0 in
---   runCode alloc (helpers <> main)
+--   runDoc alloc (helpers <> main)
 -- 
 -- -- -------------------- AST Compilation --------------------
 -- 
