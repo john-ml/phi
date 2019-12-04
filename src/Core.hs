@@ -281,56 +281,66 @@ data TCErr
 
 type TC = ExceptT (Loc, TCErr) (Reader (Map Var Ty))
 
-var :: Has Loc a => a -> Var -> TC Ty
+var :: Has Loc a => a -> Var -> TC (Exp (Ty, a))
 var a x = (M.!? x) <$> ask >>= \case
-  Just ty -> return ty
+  Just ty -> return $ AVar (ty, a) x
   Nothing -> raise a $ NotInScope x
 
-check :: Has Loc a => Exp a -> Ty -> TC ()
+check :: Has Loc a => Exp a -> Ty -> TC (Exp (Ty, a))
 check exp ty = case exp of
-  AUnreachable _ -> return ()
-  ATuple a es -> case ty of
-    Tup ts -> undefined
-    ty -> raise a $ ExGotShape "tuple" ty
+  AUnreachable a -> return $ AUnreachable (ty, a)
   AUpdate a e1 _ e2 -> undefined
   ABinop a e1 _ e2 -> undefined
   ARec a fs e -> undefined
   ACase a e d pes -> infer e >>= \case
-    Prim (I _) -> check d ty *> mapM_ (\ (_ :=> e) -> check e ty) pes
-    ty -> raise a $ ExGotShape "integer" ty
+    e'@(Anno (Prim (I _), _)) ->
+      ACase (ty, a) e'
+        <$> check d ty
+        <*> mapM (\ (p :=> e) -> (p :=>) <$> check e ty) pes
+    Anno (ty, _) -> raise a $ ExGotShape "integer" ty
 
-infer :: Has Loc a => Exp a -> TC Ty
+infer :: Has Loc a => Exp a -> TC (Exp (Ty, a))
 infer = \case
   AVar a x -> var a x
-  AInt _ _ w -> return $ Prim (I w)
-  ATuple _ es -> Tup <$> mapM infer es
+  AInt a i w -> return $ AInt (Prim (I w), a) i w
+  ATuple a es -> do
+    es' <- mapM infer es
+    return $ ATuple (Tup (map (\ (Anno (t, _)) -> t) es'), a) es'
   AUpdate a e1 _ e2 -> undefined
   AProj a e n -> infer e >>= \case
-    Tup ts
-      | n < L.genericLength ts -> return $ ts!!fromIntegral n
+    e'@(Anno (Tup ts, _))
+      | n < L.genericLength ts -> return $ AProj (ts!!fromIntegral n, a) e' n
       | otherwise -> raise a . Custom $ "tuple has no " ++ show n ++ "th element"
-    ty -> raise a $ ExGotShape "tuple" ty
-  AElem _ e1@(Anno a1) e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
-    (Arr _ t, Prim (I _)) -> return t
-    (Arr _ _, ty) -> raise a2 $ ExGotShape "integer" ty
-    (ty, _) -> raise a1 $ ExGotShape "array" ty
-  AElemV _ e1@(Anno a1) e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
-    (Vec _ t, Prim (I _)) -> return $ Prim t
-    (Vec _ _, ty) -> raise a2 $ ExGotShape "integer" ty
-    (ty, _) -> raise a1 $ ExGotShape "vector" ty
-  ACoerce a e t -> infer e $> t
+    Anno (ty, _) -> raise a $ ExGotShape "tuple" ty
+  AElem a e1@(Anno a1) e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
+    (e1'@(Anno (Arr _ t, _)), e2'@(Anno (Prim (I _), _))) -> return $ AElem (t, a) e1' e2'
+    (Anno (Arr _ _, _), Anno (ty, _)) -> raise a2 $ ExGotShape "integer" ty
+    (Anno (ty, _), _) -> raise a1 $ ExGotShape "array" ty
+  AElemV a e1@(Anno a1) e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
+    (e1'@(Anno (Vec _ t, _)), e2'@(Anno (Prim (I _), _))) -> return $ AElemV (Prim t, a) e1' e2'
+    (Anno (Vec _ _, _), Anno (ty, _)) -> raise a2 $ ExGotShape "integer" ty
+    (Anno (ty, _), _) -> raise a1 $ ExGotShape "vector" ty
+  ACoerce a e t -> ACoerce (t, a) <$> infer e <*> pure t
   ABinop a e1 o e2 -> undefined
-  ALet a x t e1 e -> check e1 t *> local (M.insert x t) (infer e)
+  ALet a x t e1 e -> do
+    e1' <- check e1 t
+    e'@(Anno (ty, _)) <- local (M.insert x t) (infer e)
+    return $ ALet (ty, a) x t e1' e'
   ACall a e es -> infer e >>= \case
-    Fun ts t -> zipWithM check es ts $> t
-    ty -> raise a $ ExGotShape "function" ty
-  AAddr _ e -> Prim . Ptr <$> infer e
+    e'@(Anno (Fun ts t, _)) -> ACall (t, a) e' <$> zipWithM check es ts
+    Anno (ty, _) -> raise a $ ExGotShape "function" ty
+  AAddr a e -> do
+    e'@(Anno (t, _)) <- infer e
+    return $ AAddr (Prim (Ptr t), a) e'
   ALoad a e -> infer e >>= \case
-    Prim (Ptr t) -> return t
-    ty -> raise a $ ExGotShape "pointer" ty
+    e'@(Anno (Prim (Ptr t), _)) -> return $ ALoad (t, a) e'
+    Anno (ty, _) -> raise a $ ExGotShape "pointer" ty
   AStore a d s e -> infer d >>= \case
-    Prim (Ptr t) -> check s t *> infer e
-    ty -> raise a $ ExGotShape "pointer" ty
+    d'@(Anno (Prim (Ptr t), _)) -> do
+      s' <- check s t
+      e'@(Anno (ty, _)) <- infer e
+      return $ AStore (ty, a) d' s' e'
+    Anno (ty, _) -> raise a $ ExGotShape "pointer" ty
   ARec a fs e -> undefined
 
 -- -------------------- Code formatting utils --------------------
