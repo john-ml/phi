@@ -1,0 +1,7 @@
+*.swp
+*.swo
+examples/out/*
+!examples/out/*.c
+runtime/tests/*
+!runtime/tests/*.c
+dist
