@@ -88,6 +88,7 @@ data Exp' a
   | Store (Exp a) (Exp a) (Exp a)
   | Rec [Ann a Helper] (Exp a)
   | Case (Exp a) (Exp a) [Arm a]
+  | Exp a ::: Ty
   deriving (Eq, Ord, Show)
 
 pattern AVar a x = (a, Var x)
@@ -107,6 +108,7 @@ pattern ALoad a e = (a, Load e)
 pattern AStore a d s e = (a, Store d s e)
 pattern ARec a fs e = (a, Rec fs e)
 pattern ACase a e d pes = (a, Case e d pes)
+pattern AAnn a e ty = (a, e ::: ty)
 
 pattern AHelper a f xts t e = (a, Helper f xts t e)
 
@@ -243,32 +245,34 @@ instance PP (Exp a) where
      ]
    ARec _ fs e -> undefined -- TODO
    ACase _ e d pes -> undefined -- TODO
+   AAnn _ e ty -> "(" <> pp e <> " : " <> pp ty <> ")"
 
 -- -------------------- Variables --------------------
 
 -- Generic fold over variables
 foldVars :: Monoid m => (Var -> m) -> Exp a -> m
 foldVars f = \case
-  AVar a x -> f x
-  AInt a _ _ -> mempty
-  AUnreachable a -> mempty
-  ATuple a es -> foldMap (foldVars f) es
-  AUpdate a e1 _ e2 -> foldVars f e1 <> foldVars f e2
-  AProj a e _ -> foldVars f e
-  AElem a e1 e2 -> foldVars f e1 <> foldVars f e2
-  AElemV a e1 e2 -> foldVars f e1 <> foldVars f e2
-  ACoerce a e _ -> foldVars f e
-  ABinop a e1 _ e2 -> foldVars f e1 <> foldVars f e2
-  ALet a x _ e1 e -> f x <> foldVars f e1 <> foldVars f e
-  ACall a e es -> foldVars f e <> foldMap (foldVars f) es
-  AAddr a e -> foldVars f e
-  ALoad a e -> foldVars f e
-  AStore a d s e -> foldVars f d <> foldVars f s <> foldVars f e
-  ARec a fs e ->
+  AVar _ x -> f x
+  AInt _ _ _ -> mempty
+  AUnreachable _ -> mempty
+  ATuple _ es -> foldMap (foldVars f) es
+  AUpdate _ e1 _ e2 -> foldVars f e1 <> foldVars f e2
+  AProj _ e _ -> foldVars f e
+  AElem _ e1 e2 -> foldVars f e1 <> foldVars f e2
+  AElemV _ e1 e2 -> foldVars f e1 <> foldVars f e2
+  ACoerce _ e _ -> foldVars f e
+  ABinop _ e1 _ e2 -> foldVars f e1 <> foldVars f e2
+  ALet _ x _ e1 e -> f x <> foldVars f e1 <> foldVars f e
+  ACall _ e es -> foldVars f e <> foldMap (foldVars f) es
+  AAddr _ e -> foldVars f e
+  ALoad _ e -> foldVars f e
+  AStore _ d s e -> foldVars f d <> foldVars f s <> foldVars f e
+  ARec _ fs e ->
     foldMap (\ (AHelper _ f' xts _ e) -> f f' <> foldMap (f . fst) xts <> foldVars f e) fs <>
     foldVars f e
-  ACase a e d pes ->
+  ACase _ e d pes ->
     foldVars f e <> foldVars f d <> foldMap (\ (_ :=> e) -> foldVars f e) pes
+  AAnn _ e _ -> foldVars f e
 
 -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
 maxUsed :: Exp a -> Var
@@ -308,7 +312,10 @@ ub p = go M.empty p `evalState` maxUsed p where
         AHelper a (σ ! f) (zip xs' (map snd xts)) t <$> go σ'' e
       ARec a helpers' <$> go σ' e
     ACase a e d pes ->
-      ACase a <$> go σ e <*> go σ d <*> mapM (\ (p :=> e) -> (p :=>) <$> go σ e) pes
+      ACase a
+        <$> go σ e <*> go σ d
+        <*> mapM (\ (p :=> e) -> (p :=>) <$> go σ e) pes
+    AAnn a e ty -> AAnn a <$> go σ e <*> pure ty
   σ ! x = M.findWithDefault x x σ
   gen = modify' succ *> get
 
@@ -375,6 +382,7 @@ check exp ty = case exp of
 
 infer :: Has Loc a => Exp a -> TC (Exp (Ty, a))
 infer = \case
+  AAnn _ e ty -> check e ty
   AVar a x -> var a x
   AInt a i w -> return $ AInt (Prim (I w), a) i w
   ATuple a es -> do
@@ -427,7 +435,7 @@ infer = \case
       AnnTy e' ty <- infer e
       return $ ARec (ty, a) helpers' e'
 
--- -- -------------------- Doc generation utils --------------------
+-- -- -------------------- Code generation utils --------------------
 -- 
 -- varG :: Var -> Doc
 -- varG x = (M.! x) . fst <$> ask >>= \case
@@ -470,7 +478,7 @@ infer = \case
 --   , line "}"
 --   ]
 -- 
--- -- -------------------- Doc generation --------------------
+-- -- -------------------- Code generation --------------------
 -- 
 -- type Gen =
 --   ReaderT Alloc -- Result of allocation
