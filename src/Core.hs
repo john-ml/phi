@@ -500,24 +500,6 @@ instrG instr = do
   tell (mempty, line' $ "%" <> show'' x <> " = " <> instr)
   return x
 
-ptyG :: PTy -> Gen Doc
-ptyG = \case
-  I w -> return $ "i" <> show'' w
-  Half -> return "half"
-  Float -> return "float"
-  Double -> return "double"
-  FP128 -> return "FP128"
-  Ptr t -> (<> "*") <$> tyG t
-
-tyG :: Ty -> Gen Doc
-tyG = \case
-  Void -> return "void"
-  Prim t -> ptyG t
-  Vec n t -> do t' <- ptyG t; return $ "<" <> show'' n <> " x " <> t' <> ">"
-  Arr n t -> do t' <- tyG t; return $ "[" <> show'' n <> " x " <> t' <> "]"
-  -- Tup ts -> "{" <> commaSep (map pp ts) <> "}"
-  -- Fun ts t -> "((" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
-
 gen :: Has Ty a => Exp a -> Gen Var
 gen = \case
   AVar _ x -> return x
