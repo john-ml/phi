@@ -15,7 +15,7 @@ import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State.Strict
 import Control.Monad.Reader
--- import Control.Monad.Writer.Strict
+import Control.Monad.Writer.Strict
 -- import Control.Monad.Trans.Maybe
 -- import Control.Applicative
 -- import Text.Show.Deriving
@@ -220,32 +220,32 @@ instance PP Binop where
 
 instance PP (Exp a) where
   pp = \case
-   AVar _ x -> show'' x
-   AInt _ i w -> show'' i <> "i" <> show'' w
-   AUnreachable _ -> "unreachable"
-   ATuple _ es -> "{" <> commaSep (map pp es) <> "}"
-   AUpdate _ e1 p e2 -> pp e1 <> " {" <> calate "." (show'' <$> p) <> " = " <> pp e2 <> "}"
-   AProj _ e n -> pp e <> "." <> show'' n
-   AElem _ e1 e2 -> pp e1 <> "[" <> pp e2 <> "]"
-   AElemV _ e1 e2 -> pp e1 <> "<" <> pp e2 <> ">"
-   ACoerce _ e t -> pp e <> " as " <> pp t
-   ABinop _ e1 o e2 -> "(" <> pp e1 <> " " <> pp o <> " " <> pp e2 <> ")"
-   ALet _ x t e1 e -> F.fold
-     [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
-     , indent (pp e1)
-     , line $ " in "
-     , pp e
-     ]
-   ACall _ e es -> pp e <> "(" <> commaSep (map pp es) <> ")"
-   AAddr _ e -> "&" <> pp e
-   ALoad _ e -> "*" <> pp e
-   AStore _ d s e -> F.fold
-     [ line' $ pp d <> " := " <> pp s <> ";"
-     , pp e
-     ]
-   ARec _ fs e -> undefined -- TODO
-   ACase _ e d pes -> undefined -- TODO
-   AAnn _ e ty -> "(" <> pp e <> " : " <> pp ty <> ")"
+    AVar _ x -> show'' x
+    AInt _ i w -> show'' i <> "i" <> show'' w
+    AUnreachable _ -> "unreachable"
+    ATuple _ es -> "{" <> commaSep (map pp es) <> "}"
+    AUpdate _ e1 p e2 -> pp e1 <> " {" <> calate "." (show'' <$> p) <> " = " <> pp e2 <> "}"
+    AProj _ e n -> pp e <> "." <> show'' n
+    AElem _ e1 e2 -> pp e1 <> "[" <> pp e2 <> "]"
+    AElemV _ e1 e2 -> pp e1 <> "<" <> pp e2 <> ">"
+    ACoerce _ e t -> pp e <> " as " <> pp t
+    ABinop _ e1 o e2 -> "(" <> pp e1 <> " " <> pp o <> " " <> pp e2 <> ")"
+    ALet _ x t e1 e -> F.fold
+      [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
+      , indent (pp e1)
+      , line $ " in "
+      , pp e
+      ]
+    ACall _ e es -> pp e <> "(" <> commaSep (map pp es) <> ")"
+    AAddr _ e -> "&" <> pp e
+    ALoad _ e -> "*" <> pp e
+    AStore _ d s e -> F.fold
+      [ line' $ pp d <> " := " <> pp s <> ";"
+      , pp e
+      ]
+    ARec _ fs e -> undefined -- TODO
+    ACase _ e d pes -> undefined -- TODO
+    AAnn _ e ty -> "(" <> pp e <> " : " <> pp ty <> ")"
 
 -- -------------------- Variables --------------------
 
@@ -477,124 +477,75 @@ infer = \case
 --     ]
 --   , line "}"
 --   ]
--- 
--- -- -------------------- Code generation --------------------
--- 
--- type Gen =
---   ReaderT Alloc -- Result of allocation
---   (StateT Word64 -- Fresh names for helper functions
---   (Writer Doc)) -- Maintain helper functions generated along the way
--- 
--- gensym :: Str -> Gen Str
--- gensym name = ("var_" <>) . (name <>) . show' <$> get <* modify' succ
--- 
--- newG :: Var -> Doc
--- newG x = line' $ declG "gt_ch" x <> " = gt_chan();"
--- 
--- sendG :: Var -> Var -> Doc
--- sendG s d = line' $ "gt_write(" <> varG d <> ", " <> varG s <> ");"
--- 
--- recvG :: Var -> Var -> Doc
--- recvG d s = line' $ declG "gt_ch" d <> " = gt_read(" <> varG s <> ");"
--- 
--- foreignExpG :: ForeignExp -> Doc
--- foreignExpG = \case
---   Atom x -> varG x
---   Call f xs ->
---     pure (D.fromList f) <> "(" <>
---       F.fold (L.intersperse "," (foreignExpG <$> xs)) <> ")"
--- 
--- evalG :: Var -> ForeignExp -> Doc
--- evalG x e = line' $ declG "gt_ch" x <> " = " <> foreignExpG e <> ";"
--- 
--- doG :: ForeignExp -> Doc
--- doG e = line' $ foreignExpG e <> ";"
--- 
--- bothG :: AnnProcess -> Set Var -> AnnProcess -> Gen Doc
--- bothG p qs q = do
---   f <- gensym "f"
---   t <- gensym "t"
---   rsp <- gensym "rsp"
---   p' <- gen p
---   q' <- gen q
---   alloc <- ask
---   let (spilled, unspilled) = S.partition (wasSpilled alloc) qs
---   let pG = if S.null spilled then procG else spillProcG spilled
---   tell $ pG (pure f) q'
---   return $ F.fold
---     [ line $ "gt_t " <> t <> " = " <> call f spilled
---     , F.fold . for (S.toAscList unspilled) $ \ v ->
---         line' $ pure t <> "->" <> varG v <> " = " <> varG v <> ";"
---     , if not $ S.null spilled
---       then line $ "gt_ch *" <> rsp <> " = ((gt_ch *)" <> t <> "->rsp) + 1;"
---       else ""
---     , F.fold . for2 [0..] (S.toAscList spilled) $ \ offset v ->
---         line' $ pure rsp <> "[" <> show'' offset <> "] = " <> varG v <> ";"
---     , p'
---     ]
---   where
---     call :: Str -> Set Var -> Str
---     call f spilled
---       | S.null spilled = "gt_go(" <> f <> ", " <> show' (stackSize spilled q) <> ");"
---       | otherwise = "gt_go_alloca(" <>
---           f <> ", " <> show' (spillSize spilled) <> ", " <>
---           show' (stackSize spilled q) <> ");"
--- 
---     wasSpilled :: Alloc -> Var -> Bool
---     wasSpilled alloc q =
---       case alloc M.!? q of
---         Just (Spill _) -> True
---         _ -> False
--- 
---     spillSize :: Set Var -> Int
---     spillSize spilled = 16 * ((S.size spilled + 1) `div` 2)
---     
---     stackSize :: Set Var -> AnnProcess -> Int
---     stackSize spilled = \case
---       Evals True _ -> 0x100000 + spillSize spilled
---       Evals False _ -> 0x100 + spillSize spilled
--- 
--- gen :: AnnProcess -> Gen Doc
--- gen = \case
---   AHalt _ -> pure ""
---   ANew _ x p -> (newG x <>) <$> gen p
---   ASend _ s d p -> (sendG s d <>) <$> gen p
---   ARecv _ d s p -> (recvG d s <>) <$> gen p
---   AEval _ x e p -> (evalG x e <>) <$> gen p
---   ADo _ e p -> (doG e <>) <$> gen p
---   ABoth _ p (FV qs q) -> bothG p qs q
---   APick _ p q -> do
---     p' <- gen p
---     q' <- gen q
---     return $ F.fold
---       [ line "if (rand() & 1) {"
---       , indent p'
---       , line "} else {"
---       , indent q'
---       , line "}"
---       ]
---   ALoop _ p -> do
---     p' <- gen p
---     return $ F.fold
---       [ line "for (;;) {"
---       , indent p'
---       , line "}"
---       ]
---   AMatch _ x yps -> do
---     let x' = varG x
---     yps' <- forM yps $ \ (y, p) -> (varG y, ) <$> gen p
---     return $ F.fold
---       [ line $ "if (0) {}"
---       , F.fold . for yps' $ \ (y', p') -> F.fold
---         [ line' $ "else if (" <> x' <> " == " <> y' <> ") {"
---         , indent p'
---         , line "}"
---         ]
---       ]
---   AForeign _ body p -> do
---     tell . foldMap (line . D.fromList) $ lines body
---     gen p
--- 
+
+-- -------------------- Code generation --------------------
+
+varG :: Var -> Doc
+varG x = "%" <> show'' x
+
+type Gen =
+  ReaderT (Set Var) -- Rec functions
+  (StateT Var -- Fresh names for helper functions
+  (Writer (Doc, Doc))) -- (Global definitions, code generated along the way)
+
+fresh :: Gen Var
+fresh = get <* modify' succ
+
+gensym :: Doc -> Gen Doc
+gensym name = ("%" <>) . (name <>) . show'' <$> fresh
+
+instrG :: Doc -> Gen Var
+instrG instr = do
+  x <- fresh
+  tell (mempty, line' $ "%" <> show'' x <> " = " <> instr)
+  return x
+
+ptyG :: PTy -> Gen Doc
+ptyG = \case
+  I w -> return $ "i" <> show'' w
+  Half -> return "half"
+  Float -> return "float"
+  Double -> return "double"
+  FP128 -> return "FP128"
+  Ptr t -> (<> "*") <$> tyG t
+
+tyG :: Ty -> Gen Doc
+tyG = \case
+  Void -> return "void"
+  Prim t -> ptyG t
+  Vec n t -> do t' <- ptyG t; return $ "<" <> show'' n <> " x " <> t' <> ">"
+  Arr n t -> do t' <- tyG t; return $ "[" <> show'' n <> " x " <> t' <> "]"
+  -- Tup ts -> "{" <> commaSep (map pp ts) <> "}"
+  -- Fun ts t -> "((" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
+
+gen :: Has Ty a => Exp a -> Gen Var
+gen = \case
+  AVar _ x -> return x
+  -- AInt (π -> ty :: Ty) i _ -> instrG $ "add " <> pp ty <> " 0, " <> show'' i
+  AUnreachable _ -> undefined -- TODO
+  -- ATuple _ es -> "{" <> commaSep (map pp es) <> "}"
+  -- AUpdate _ e1 p e2 -> pp e1 <> " {" <> calate "." (show'' <$> p) <> " = " <> pp e2 <> "}"
+  -- AProj _ e n -> pp e <> "." <> show'' n
+  -- AElem _ e1 e2 -> pp e1 <> "[" <> pp e2 <> "]"
+  -- AElemV _ e1 e2 -> pp e1 <> "<" <> pp e2 <> ">"
+  -- ACoerce _ e t -> pp e <> " as " <> pp t
+  -- ABinop _ e1 o e2 -> "(" <> pp e1 <> " " <> pp o <> " " <> pp e2 <> ")"
+  -- ALet _ x t e1 e -> F.fold
+  --   [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
+  --   , indent (pp e1)
+  --   , line $ " in "
+  --   , pp e
+  --   ]
+  -- ACall _ e es -> pp e <> "(" <> commaSep (map pp es) <> ")"
+  -- AAddr _ e -> "&" <> pp e
+  -- ALoad _ e -> "*" <> pp e
+  -- AStore _ d s e -> F.fold
+  --   [ line' $ pp d <> " := " <> pp s <> ";"
+  --   , pp e
+  --   ]
+  -- ARec _ fs e -> undefined -- TODO
+  -- ACase _ e d pes -> undefined -- TODO
+
 -- genTop :: AnnProcess -> Gen Doc
 -- genTop (FV vs p) = do
 --   tell $ line "#include <stdlib.h>"
