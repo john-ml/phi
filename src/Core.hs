@@ -1,9 +1,12 @@
 module Core where
 
+import Data.Set (Set); import qualified Data.Set as S
+import Data.Map.Strict (Map); import qualified Data.Map.Strict as M
+
 import qualified Data.List as L
 import Data.Semigroup
 import qualified Data.Foldable as F
--- import Data.Bifunctor
+import Data.Bifunctor
 import Data.Functor
 -- import Data.Functor.Foldable
 -- import Data.Functor.Foldable.TH
@@ -15,7 +18,7 @@ import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Writer.Strict
 -- import Control.Monad.Trans.Maybe
--- import Control.Applicative
+import Control.Applicative
 -- import Text.Show.Deriving
 -- 
 -- import Data.SBV
@@ -23,18 +26,17 @@ import Control.Monad.Writer.Strict
 -- 
 import Data.String (IsString (..))
 import Data.DList (DList); import qualified Data.DList as D
--- 
--- import Data.Char
--- import Data.Void
--- import Text.Megaparsec (ParsecT, MonadParsec)
--- import qualified Text.Megaparsec as P
--- import Text.Megaparsec.Char
--- import qualified Text.Megaparsec.Char.Lexer as L
+
+import Data.Char
+import Data.Void
+import Text.Megaparsec (ParsecT, MonadParsec)
+import qualified Text.Megaparsec as P
+import Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer as L
 
 import Util
 
 import Data.HList.CommonMain
-
 import Control.Lens
 
 -- -------------------- Object language --------------------
@@ -55,10 +57,10 @@ data PTy
 data Ty
   = Void
   | PTy PTy
-  | Vec Integer PTy
-  | Arr Integer Ty
+  | Vec Word PTy
+  | Arr Word Ty
   | Tup [Ty]
-  | Fun [Ty] Ty
+  | FPtr [Ty] Ty
   deriving (Eq, Ord, Show)
 
 -- LLVM has 3 ways of reading substructures:
@@ -83,18 +85,18 @@ type Width = Word
 data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (Eq, Ord, Show)
 
 -- Expressions
-data Arm a = Integer :=> Exp a deriving (Eq, Ord, Show)
+data Arm a = Maybe Integer :=> Exp a deriving (Eq, Ord, Show)
 data Exp a
   -- Primitives
   = Var a Var
   | Int a Integer Width
   | Ann a (Exp a) Ty
-  | Prim a Prim [(a, Exp a)]
+  | Prim a Prim [Exp a]
   | Coerce a (Exp a) Ty
   | Let a Var Ty (Exp a) (Exp a)
   -- Control flow / name binding
   | Call a (Exp a) [Exp a]
-  | Case a (Exp a) (Exp a) [Arm a]
+  | Case a (Exp a) [Arm a]
   | Rec a [Func a] (Exp a) -- Function bundle
   -- Aggregates
   | Tuple a [Exp a]
@@ -117,88 +119,85 @@ data Exp a
 --   Technically, these functions can also become SSA blocks if only called in tail
 --   position, but that probably doesn't buy much.
 
-data Loc = Loc
-  { locFile :: Maybe String
-  , locLine :: Int
-  , locCol :: Int
-  } deriving (Eq, Ord, Show)
-
 -- -------------------- Some boilerplate to work with annotations --------------------
 
 makeLabelable "typ loc"
 
+type ParseAnn = Record '[Tagged "loc" P.SourcePos]
+type TyAnn = Record '[Tagged "typ" Ty, Tagged "loc" P.SourcePos]
+
 raise a e = throwError (a ^. loc, e)
--- https://github.com/danielwaterworth/HList/blob/master/examples/labelable.hs
 
 -- -------------------- Doc formatting utils --------------------
 
--- type Str = DList Char -- For efficient catenation
--- 
--- -- Indentation + φ sets as input
--- -- Phi sets represented as f ↦ x ↦ actuals
--- type Doc = Reader (Str, Map Var (Map Var (Set Var))) Str
--- deriving instance Semigroup a => Semigroup (Reader r a)
--- deriving instance Monoid a => Monoid (Reader r a)
--- 
--- show' :: Show a => a -> Str
--- show' = D.fromList . show
--- 
--- show'' :: Show a => a -> Doc
--- show'' = pure . show'
--- 
--- runDoc :: Doc -> String
--- runDoc c = D.toList $ c `runReader` ""
--- 
--- instance IsString Doc where fromString = pure . D.fromList
--- 
--- indent :: Doc -> Doc
--- indent = local ("  " <>)
--- 
--- line :: Str -> Doc
--- line l = reader $ \ s -> s <> l <> "\n"
--- 
--- line' :: Doc -> Doc
--- line' l = reader $ \ s -> s <> runReader l s <> "\n"
--- 
--- calate :: Doc -> [Doc] -> Doc
--- calate sep ds = F.fold (L.intersperse sep ds)
--- 
--- commaSep :: [Doc] -> Doc
--- commaSep = calate ", "
--- 
--- class PP a where pp :: a -> Doc
--- 
--- instance PP PTy where
---   pp = \case
---     I w -> "i" <> show'' w
---     Half -> "half"
---     Float -> "float"
---     Double -> "double"
---     FP128 -> "FP128"
---     Ptr t -> pp t <> "*"
--- 
--- instance PP Ty where
---   pp = \case
---     Void -> "void"
---     Prim t -> pp t
---     Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
---     Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
---     Tup ts -> "{" <> commaSep (map pp ts) <> "}"
---     Fun ts t -> "((" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
--- 
--- instance PP (Func a) where
---   pp (Func f xts t e) =
---     let xts' = map (\ (x, t) -> show'' x <> ": " <> pp t) xts in
---     show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " =" <> indent (pp e)
--- 
--- instance PP Binop where
---   pp = \case
---     Add -> "+"
---     Mul -> "*"
---     Sub -> "-"
---     Div -> "/"
--- 
--- instance PP (Exp a) where
+type Str = DList Char -- For efficient catenation
+
+-- Indentation + φ sets as input
+-- Phi sets represented as f ↦ x ↦ actuals
+type Usages = Map Var (Map Var (Set Var))
+type Doc = Reader (Str, Usages) Str
+deriving instance Semigroup a => Semigroup (Reader r a)
+deriving instance Monoid a => Monoid (Reader r a)
+
+show' :: Show a => a -> Str
+show' = D.fromList . show
+
+show'' :: Show a => a -> Doc
+show'' = pure . show'
+
+runDoc :: Doc -> Usages -> String
+runDoc c usages = D.toList $ c `runReader` ("", usages)
+
+instance IsString Doc where fromString = pure . D.fromList
+
+indent :: Doc -> Doc
+indent = local (first ("  " <>))
+
+line :: Str -> Doc
+line l = reader $ \ (s, _) -> s <> l <> "\n"
+
+line' :: Doc -> Doc
+line' l = reader $ \ r@(s, _) -> s <> runReader l r <> "\n"
+
+calate :: Doc -> [Doc] -> Doc
+calate sep ds = F.fold (L.intersperse sep ds)
+
+commaSep :: [Doc] -> Doc
+commaSep = calate ", "
+
+class PP a where pp :: a -> Doc
+
+instance PP PTy where
+  pp = \case
+    I w -> "i" <> show'' w
+    Half -> "half"
+    Float -> "float"
+    Double -> "double"
+    FP128 -> "FP128"
+    Ptr t -> "&" <> pp t
+
+instance PP Ty where
+  pp = \case
+    Void -> "void"
+    PTy t -> pp t
+    Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
+    Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
+    Tup ts -> "{" <> commaSep (map pp ts) <> "}"
+    FPtr ts t -> "(fun (" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
+
+instance PP (Func a) where
+  pp (Func _ f xts t e) =
+    let xts' = map (\ (_, x, t) -> show'' x <> ": " <> pp t) xts in
+    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " =" <> indent (pp e)
+
+instance PP Prim where
+  pp = \case
+    Add -> "add"
+    Mul -> "mul"
+    Sub -> "sub"
+    Div -> "div"
+
+instance PP (Exp a) where pp = undefined
 --   pp = \case
 --     AVar _ x -> show'' x
 --     AInt _ i w -> show'' i <> "i" <> show'' w
@@ -308,53 +307,115 @@ raise a e = throwError (a ^. loc, e)
 -- -- fv :: Process -> Set Var
 -- -- fv = cata fvF
 -- -- 
--- 
--- -- -------------------- Type checking --------------------
--- 
--- data TCErr
---   = NotInScope Var
---   | ExGotShape String Ty
---   | ExGot Ty Ty
---   | BadPath Path
---   | Custom String
--- 
--- instance PP TCErr where
---   pp = \case
---     NotInScope x -> line $ "Variable not in scope: " <> show' x
---     ExGotShape shape ty ->
---       line' $ "Expected " <> pure (D.fromList shape) <> " but got " <> pp ty
---     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
---     BadPath p -> line $ "Bad path: " <> F.fold (L.intersperse "." (show' <$> p))
---     Custom s -> line $ D.fromList s
--- 
--- type TC = ExceptT (Loc, TCErr) (Reader (Map Var Ty))
--- 
--- var :: Has Loc a => a -> Var -> TC (Exp (Ty, a))
--- var a x = (M.!? x) <$> ask >>= \case
---   Just ty -> return $ AVar (ty, a) x
---   Nothing -> raise a $ NotInScope x
--- 
--- pattern AnnTy e ty <- ((\ x -> (x, x)) -> (e, Anno (ty, _)))
--- pattern AnnoTy ty <- Anno (ty, _)
--- 
--- check :: Has Loc a => Exp a -> Ty -> TC (Exp (Ty, a))
--- check exp ty = case exp of
---   ACase a e d pes -> infer e >>= \case
---     AnnTy e' (Prim (I _)) ->
---       ACase (ty, a) e'
---         <$> check d ty
---         <*> mapM (\ (p :=> e) -> (p :=>) <$> check e ty) pes
---     AnnoTy ty -> raise a $ ExGotShape "integer" ty
---   exp@(Anno a) -> infer exp >>= \case
---     AnnTy exp' ty'
---       | ty' == ty -> return exp'
---       | otherwise -> raise a $ ExGot ty ty'
--- 
--- infer :: Has Loc a => Exp a -> TC (Exp (Ty, a))
--- infer = \case
---   AAnn _ e ty -> check e ty
---   AVar a x -> var a x
---   AInt a i w -> return $ AInt (Prim (I w), a) i w
+
+-- -------------------- Type checking --------------------
+
+data TCErr
+  = NotInScope Var
+  | ExGotShape String Ty
+  | ExGot Ty Ty
+  | Custom String
+
+instance PP TCErr where
+  pp = \case
+    NotInScope x -> line $ "Variable not in scope: " <> show' x
+    ExGotShape shape ty ->
+      line' $ "Expected " <> pure (D.fromList shape) <> " but got " <> pp ty
+    ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
+    Custom s -> line $ D.fromList s
+
+type TC = ExceptT (P.SourcePos, TCErr) (Reader (Map Var Ty))
+
+runTC' :: TC a -> Map Var Ty -> Either (P.SourcePos, TCErr) a
+runTC' m r = runExceptT m `runReader` r
+
+runTC :: TC a -> Either String a
+runTC m = first pretty $ runTC' m M.empty where
+  pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err) M.empty
+
+check :: Exp ParseAnn -> Ty -> TC (Exp TyAnn)
+check exp ty = case exp of
+  Case a e pes -> infer e >>= \case
+    (PTy (I _), e') -> do
+      pes' <- mapM (\ (p :=> e) -> (p :=>) <$> check e ty) pes
+      return $ Case (typ .==. ty .*. a) e' pes'
+    (ty, _) -> raise a $ ExGotShape "integer" ty
+  exp@(anno -> a) -> infer exp >>= \case
+    (ty', exp')
+      | ty' == ty -> return exp'
+      | otherwise -> raise a $ ExGot ty ty'
+  where
+    anno = \case
+      Var a _ -> a
+      Int a _ _ -> a
+      Ann a _ _ -> a
+      Prim a _ _ -> a
+      Coerce a _ _ -> a
+      Let a _ _ _ _ -> a
+      Call a _ _ -> a
+      Case a _ _ -> a
+      Rec a _ _ -> a
+
+checkNumOp :: ParseAnn -> [Exp ParseAnn] -> TC (Ty, [Exp TyAnn])
+checkNumOp a = \case
+  [] -> raise a . Custom $ "Expected at least one argument"
+  (e:es) -> do
+    (t, e') <- infer e
+    when (not (numeric t)) . raise a $ ExGotShape "numeric type" t
+    es' <- zipWithM check es (repeat t)
+    return (t, e':es')
+  where
+    numeric = \case
+      PTy (I _) -> True
+      PTy Half -> True
+      PTy Float -> True
+      PTy Double -> True
+      PTy FP128 -> True
+
+checkPrim :: ParseAnn -> [Exp ParseAnn] -> Prim -> TC (Ty, [Exp TyAnn])
+checkPrim a es = \case
+  Add -> checkNumOp a es
+  Mul -> checkNumOp a es
+  Sub -> checkNumOp a es
+  Div -> checkNumOp a es
+
+var :: ParseAnn -> Var -> TC (Ty, Exp TyAnn)
+var a x = (M.!? x) <$> ask >>= \case
+  Just ty -> return $ (ty, Var (typ .==. ty .*. a) x)
+  Nothing -> raise a $ NotInScope x
+
+infer :: Exp ParseAnn -> TC (Ty, Exp TyAnn)
+infer = \case
+  Var a x -> var a x
+  Int a i w -> let t = PTy (I w) in return (t, Int (typ .==. t .*. a) i w)
+  Ann _ e ty -> (ty, ) <$> check e ty
+  Prim a p es -> do
+    (t, es') <- checkPrim a es p
+    return (t, Prim (typ .==. t .*. a) p es')
+  Coerce a e ty -> do
+    (_, e') <- infer e
+    return (ty, Coerce (typ .==. ty .*. a) e' ty)
+  Let a x t e1 e -> do
+    e1' <- check e1 t
+    (ty, e') <- local (M.insert x t) (infer e)
+    return (ty, Let (typ .==. ty .*. a) x t e1' e')
+  Call a e es -> infer e >>= \case
+    (FPtr ts t, e') -> do
+      es' <- zipWithM check es ts
+      return (t, Call (typ .==. t .*. a) e' es')
+    (ty, _) -> raise a $ ExGotShape "function" ty
+  Rec a funcs e -> do
+    let fs = map (\ (Func _ f _ _ _) -> f) funcs
+    let ts = map (\ (Func _ _ axts t _) -> FPtr (map (\ (_, _, t) -> t) axts) t) funcs
+    local (M.union . M.fromList $ zip fs ts) $ do
+      funcs' <- forM funcs $ \ (Func a f axts t e) -> do
+        let xts = map (\ (_, x, t) -> (x, t)) axts
+        let axts' = map (\ (a, x, t) -> (typ .==. Void .*. a, x, t)) axts
+        current <- ask
+        e' <- local (M.union $ M.fromList xts) (check e t)
+        return $ Func (typ .==. Void .*. a) f axts' t e'
+      (ty, e') <- infer e
+      return (ty, Rec (typ .==. ty .*. a) funcs' e')
 --   ATuple a es -> do
 --     es' <- mapM infer es
 --     return $ ATuple (Tup (map (\ (AnnoTy t) -> t) es'), a) es'
@@ -367,13 +428,6 @@ raise a e = throwError (a ^. loc, e)
 --     (AnnTy e1' t1, AnnTy e2' t2)
 --       | t1 == t2 -> return $ ABinop (t1, a) e1' o e2'
 --       | otherwise -> raise a2 $ ExGot t1 t2
---   ALet a x t e1 e -> do
---     e1' <- check e1 t
---     AnnTy e' ty <- local (M.insert x t) (infer e)
---     return $ ALet (ty, a) x t e1' e'
---   ACall a e es -> infer e >>= \case
---     AnnTy e' (Fun ts t) -> ACall (t, a) e' <$> zipWithM check es ts
---     AnnoTy ty -> raise a $ ExGotShape "function" ty
 --   AGep a e p -> undefined -- TODO
 --   ALoad a e -> infer e >>= \case
 --     AnnTy e' (Prim (Ptr t)) -> return $ ALoad (t, a) e'
@@ -384,15 +438,7 @@ raise a e = throwError (a ^. loc, e)
 --       AnnTy e' ty <- infer e
 --       return $ AStore (ty, a) d' s' e'
 --     AnnoTy ty -> raise a $ ExGotShape "pointer" ty
---   ARec a helpers e -> do
---     let fs = map (\ (AFunc _ f _ _ _) -> f) helpers
---     let ts = map (\ (AFunc _ _ xts t _) -> Fun (map snd xts) t) helpers
---     local (M.union . M.fromList $ zip fs ts) $ do
---       helpers' <- forM helpers $ \ (AFunc a f xts t e) ->
---         AFunc (Void, a) f xts t <$> local (M.union $ M.fromList xts) (check e t)
---       AnnTy e' ty <- infer e
---       return $ ARec (ty, a) helpers' e'
--- 
+
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 
 -- -- varG :: Var -> Doc
@@ -537,136 +583,152 @@ raise a e = throwError (a ^. loc, e)
 -- -- codeGen :: Process -> IO String
 -- -- codeGen = codeGen' True
 -- -- 
--- -- -- -------------------- Parsing utils --------------------
--- -- 
--- -- newtype PError = PError String deriving (Eq, Ord)
--- -- 
--- -- type Parser = ParsecT PError String (State (Map String Word64))
--- -- 
--- -- instance P.ShowErrorComponent PError where
--- --   showErrorComponent (PError s) = s
--- -- 
--- -- sc :: Parser ()
--- -- sc = L.space space1 empty empty
--- -- 
--- -- lexeme :: Parser a -> Parser a
--- -- lexeme = L.lexeme sc
--- -- 
--- -- symbol :: String -> Parser String
--- -- symbol = L.symbol sc
--- -- 
--- -- tryAll :: (Foldable f, MonadParsec e s m) => f (m a) -> m a
--- -- tryAll = foldr ((<|>) . P.try) empty
--- -- 
--- -- symbols :: [String] -> Parser String
--- -- symbols = tryAll . fmap symbol
--- -- 
--- -- parens :: Parser a -> Parser a
--- -- parens = P.between (symbol "(") (symbol ")")
--- -- 
--- -- braces :: Parser a -> Parser a
--- -- braces = P.between (symbol "{") (symbol "}")
--- -- 
--- -- -- -------------------- Parsing --------------------
--- -- 
--- -- keywords :: [String]
--- -- keywords = ["new", "all", "any", "loop", "match", "foreign", "do"]
--- -- 
--- -- word :: Parser String
--- -- word = do
--- --   s <- lexeme $ some (alphaNumChar <|> char '_')
--- --   guard . not $ s `elem` keywords
--- --   return s
--- -- 
--- -- varP' :: Bool -> Parser Var
--- -- varP' strict = do
--- --   x <- word
--- --   (M.!? x) <$> get >>= \case
--- --     Nothing | strict ->
--- --       P.customFailure . PError $ "Variable not in scope: " ++ x
--- --     Nothing -> do
--- --       n <- fromIntegral . M.size <$> get
--- --       modify' (M.insert x n)
--- --       return n
--- --     Just n -> return n
--- -- 
--- -- varP :: Parser Var = varP' True
--- -- 
--- -- bindP :: Parser Var = varP' False
--- -- 
--- -- haltP :: Parser Process = Halt <$ symbol "."
--- -- 
--- -- contP :: Parser Process = P.try haltP <|> symbol ";" *> procP
--- -- 
--- -- newP :: Parser Process = symbol "new" >> mkNew <$> some bindP <*> contP where
--- --   mkNew xs p = foldr New p xs
--- -- 
--- -- sendP :: Parser Process = Send <$> varP <* symbol "->" <*> varP <*> contP
--- -- 
--- -- recvP :: Parser Process = Recv <$> bindP <* symbol "<-" <*> varP <*> contP
--- -- 
--- -- binopP :: String -> (Process -> Process -> Process) -> Parser Process
--- -- binopP keyword op = symbol keyword >> mk <$> braces (many procP) where
--- --   mk = \case
--- --     [] -> Halt
--- --     [p] -> p
--- --     x:xs -> L.foldl' op x xs
--- -- 
--- -- anyP :: Parser Process = binopP "any" (:+:)
--- -- 
--- -- allP :: Parser Process = binopP "all" (:|:)
--- -- 
--- -- loopP :: Parser Process = symbol "loop" >> Loop <$> procP
--- -- 
--- -- matchP :: Parser Process
--- -- matchP = symbol "match" >> Match <$> varP <*> braces (many armP) where
--- --   armP = (,) <$> varP <* symbol "=>" <*> procP
--- -- 
--- -- foreignP :: Parser Process
--- -- foreignP = symbol "foreign" >> symbol "{" >> Foreign <$> suffix 0 <*> procP where
--- --   suffix n = (++) <$> P.takeWhileP Nothing nonBrace <*> bodyP n
--- --   bodyP n = tryAll
--- --     [ (++) <$> string "{" <*> suffix (n + 1)
--- --     , string "}" >>
--- --         if n == 0
--- --         then sc $> ""
--- --         else (\ x y -> "}" ++ x ++ y) <$> spaces <*> suffix (n - 1)
--- --     ]
--- --   nonBrace = \case
--- --     '{' -> False
--- --     '}' -> False
--- --     _ -> True
--- --   spaces = P.takeWhileP Nothing isSpace
--- -- 
--- -- foreignExpP :: Parser ForeignExp
--- -- foreignExpP = Call <$> word <*> many argP where
--- --   argP = P.try (parens foreignExpP) <|> (Atom <$> varP)
--- -- 
--- -- evalP :: Parser Process
--- -- evalP = Eval <$> bindP <* symbol "<~" <*> foreignExpP <*> contP
--- -- 
--- -- doP :: Parser Process
--- -- doP = symbol "do" >> Do <$> foreignExpP <*> contP
--- -- 
--- -- procP :: Parser Process
--- -- procP = tryAll
--- --   [ -- Try stuff that starts with keywords first...
--- --     newP, doP, anyP, allP, loopP, matchP, foreignP
--- --   , -- ...before the stuff with arrows in them
--- --     sendP, recvP, evalP
--- --   ]
--- -- 
--- -- parse' :: String -> String -> Either String Process
--- -- parse' fname s =
--- --   first P.errorBundlePretty
--- --     $ P.runParserT (procP <* P.eof) fname s `evalState` M.empty
--- -- 
--- -- parse :: String -> Either String Process
--- -- parse s = parse' "" s
--- -- 
--- -- parseFile :: FilePath -> IO (Either String Process)
--- -- parseFile f = parse' f <$> readFile f
--- -- 
+-- -------------------- Parsing utils --------------------
+
+newtype PError = PError String deriving (Eq, Ord)
+
+type Parser = ParsecT PError String (State (Map String Word))
+
+instance P.ShowErrorComponent PError where showErrorComponent (PError s) = s
+
+sc :: Parser ()
+sc = L.space space1 empty empty
+
+lexeme :: Parser a -> Parser a
+lexeme = L.lexeme sc
+
+symbol :: String -> Parser String
+symbol = L.symbol sc
+
+tryAll :: (Foldable f, MonadParsec e s m) => f (m a) -> m a
+tryAll = foldr ((<|>) . P.try) empty
+
+symbols :: [String] -> Parser String
+symbols = tryAll . fmap symbol
+
+parens :: Parser a -> Parser a
+parens = P.between (symbol "(") (symbol ")")
+
+braces :: Parser a -> Parser a
+braces = P.between (symbol "{") (symbol "}")
+
+brackets :: Parser a -> Parser a
+brackets = P.between (symbol "[") (symbol "]")
+
+angles :: Parser a -> Parser a
+angles = P.between (symbol "<") (symbol ">")
+
+tupleOf :: Parser a -> Parser [a]
+tupleOf p = parens (p `P.sepBy` symbol ",")
+
+-- -------------------- Parsing --------------------
+
+keywords :: [String]
+keywords = ["rec", "and", "in", "case", "as"]
+
+word :: Parser String
+word = do
+  s <- lexeme $ some (alphaNumChar <|> char '_')
+  guard . not $ s `elem` keywords
+  return s
+
+varP' :: Bool -> Parser Var
+varP' strict = do
+  x <- word
+  (M.!? x) <$> get >>= \case
+    Nothing | strict ->
+      P.customFailure . PError $ "Variable not in scope: " ++ x
+    Nothing -> do
+      n <- fromIntegral . M.size <$> get
+      modify' (M.insert x n)
+      return n
+    Just n -> return n
+
+varP :: Parser Var = varP' True
+
+bindP :: Parser Var = varP' False
+
+wordP :: Parser Word = read <$> lexeme (P.takeWhile1P (Just "digit") isDigit)
+
+intP :: Parser Integer
+intP = read <$> lexeme ((++) <$> tryAll ["-", ""] <*> P.takeWhile1P (Just "digit") isDigit)
+
+ptyP :: Parser PTy
+ptyP = tryAll
+  [ "i" >> I <$> wordP
+  , symbol "half" $> Half
+  , symbol "float" $> Float
+  , symbol "double" $> Double
+  , symbol "fp128" $> FP128
+  , parens ptyP
+  , symbol "&" >> Ptr <$> tyP
+  ]
+
+tyP :: Parser Ty
+tyP = tryAll
+  [ symbol "void" $> Void
+  , angles $ Vec <$> wordP <* symbol "x" <*> ptyP
+  , brackets $ Arr <$> wordP <* symbol "x" <*> tyP
+  , braces $ Tup <$> P.many tyP
+  , symbol "fun" >> FPtr <$> tupleOf tyP <* symbol "->" <*> tyP
+  , PTy <$> ptyP
+  , parens tyP
+  ]
+
+widthP :: Parser Width = wordP
+
+primP :: Parser Prim
+primP = tryAll
+  [ symbol "add" $> Add
+  , symbol "mul" $> Mul
+  , symbol "sub" $> Sub
+  , symbol "div" $> Div
+  ]
+
+locP :: Parser ParseAnn = (\ pos -> loc .==. pos .*. emptyRecord) <$> P.getSourcePos
+
+funcP :: Parser (Func ParseAnn)
+funcP =
+  Func
+    <$> locP <*> bindP <*> tupleOf argP <* symbol ":" <*> tyP <* symbol "="
+    <*> expP
+  where
+    argP = (,,) <$> locP <*> bindP <* symbol ":" <*> tyP
+
+armP :: Parser (Arm ParseAnn)
+armP = (:=>) <$> (tryAll [Just <$> intP, symbol "_" $> Nothing]) <* symbol "=>" <*> expP
+
+expP :: Parser (Exp ParseAnn)
+expP = do
+  loc <- locP
+  e <- tryAll
+    [ Var loc <$> varP
+    , Int loc <$> intP <* symbol "i" <*> widthP
+    , Prim loc <$> primP <*> tupleOf expP
+    , symbol "let" >> Let loc
+        <$> bindP <* symbol ":" <*> tyP <* symbol "="
+        <*> expP <* symbol "in" <*> expP
+    , symbol "case" >> Case loc <$> expP <*> braces (armP `P.sepBy` symbol ",")
+    , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
+    , parens expP
+    ]
+  tryAll
+    [ symbol ":" >> Ann loc e <$> tyP
+    , symbol "as" >> Coerce loc e <$> tyP
+    , Call loc e <$> tupleOf expP
+    , pure e
+    ]
+
+parse' :: String -> String -> Either String (Exp ParseAnn)
+parse' fname s =
+  first P.errorBundlePretty
+    $ P.runParserT (expP <* P.eof) fname s `evalState` M.empty
+
+parse :: String -> Either String (Exp ParseAnn) = parse' ""
+
+parseFile :: FilePath -> IO (Either String (Exp ParseAnn))
+parseFile f = parse' f <$> readFile f
+
 -- -- -- -------------------- Compilation to C --------------------
 -- -- 
 -- -- transpile :: String -> IO (Either String String)
