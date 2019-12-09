@@ -1,8 +1,6 @@
 module Core where
 
 import qualified Data.List as L
-import Data.Set (Set, (\\)); import qualified Data.Set as S
-import Data.Map.Strict (Map); import qualified Data.Map.Strict as M
 import Data.Semigroup
 import qualified Data.Foldable as F
 -- import Data.Bifunctor
@@ -33,38 +31,16 @@ import Data.DList (DList); import qualified Data.DList as D
 -- import Text.Megaparsec.Char
 -- import qualified Text.Megaparsec.Char.Lexer as L
 
--- -------------------- Utils --------------------
+import Util
 
-accM :: (Foldable t, Monad m) => t a -> b -> (b -> a -> m b) -> m b
-accM xs e f = foldM f e xs
+import Data.HList.CommonMain
 
-acciM :: (Num i, Foldable t, Monad m) => t a -> b -> (i -> b -> a -> m b) -> m b
-acciM xs e f = snd <$> foldM (\ (i, b) a -> (i + 1, ) <$> f i b a) (0, e) xs
-
--- for :: [a] -> (a -> b) -> [b]
--- for xs f = map f xs
--- 
--- for2 :: [a] -> [b] -> (a -> b -> c) -> [c]
--- for2 xs ys f = zipWith f xs ys
--- 
--- (∪) :: Ord a => Set a -> Set a -> Set a
--- (∪) = S.union
-
-(∈) :: Ord a => a -> Set a -> Bool
-(∈) = S.member
-
--- (∉) :: Ord a => a -> Set a -> Bool
--- (∉) = S.notMember
--- 
--- -- Fixed point computation
--- fixed :: (a -> Writer Any a) -> a -> a
--- fixed f x = if p then fixed f y else y where (y, Any p) = runWriter (f x)
--- 
+import Control.Lens
 
 -- -------------------- Object language --------------------
 
--- Binary operators
-data Binop
+-- Primitives
+data Prim
   = Add | Sub | Mul | Div
   deriving (Eq, Ord, Show)
 
@@ -78,7 +54,7 @@ data PTy
 -- Types
 data Ty
   = Void
-  | Prim PTy
+  | PTy PTy
   | Vec Integer PTy
   | Arr Integer Ty
   | Tup [Ty]
@@ -104,8 +80,7 @@ type Var = Word
 type Width = Word
 
 -- Local function definition
-data Param a = Param a Var Ty deriving (Eq, Ord, Show)
-data Func a = Func a Var [Param a] Ty (Exp a) deriving (Eq, Ord, Show)
+data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (Eq, Ord, Show)
 
 -- Expressions
 data Arm a = Integer :=> Exp a deriving (Eq, Ord, Show)
@@ -114,7 +89,7 @@ data Exp a
   = Var a Var
   | Int a Integer Width
   | Ann a (Exp a) Ty
-  | Binop a (Exp a) Binop (Exp a)
+  | Prim a Prim [(a, Exp a)]
   | Coerce a (Exp a) Ty
   | Let a Var Ty (Exp a) (Exp a)
   -- Control flow / name binding
@@ -132,7 +107,9 @@ data Exp a
 
 -- Since this is LLVM and not λ-calculus, every function must satisfy some conditions
 -- so that they can be implemented as SSA blocks using φ-nodes instead of closures.
--- - A function f "needs" variable x if x ∈ FV(body of f) or f calls g and g needs x.
+-- - A function f "needs" variable x if, assuming UB,
+--   (1) x ∈ FV(body of f) or
+--   (2) f calls g, g needs x, and x ∉ BV(body of f).
 -- - All calls to functions which need variables must be in tail position.
 -- - These tail calls will become `br` instructions and the corresponding functions
 --   will become SSA blocks with φ-nodes.
@@ -148,13 +125,10 @@ data Loc = Loc
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
-class Has t tup where π :: tup -> t
-instance Has t t where π = id
-instance Has t (t, tup) where π = fst
-instance Has t tup => Has t (a, tup) where π = π . snd
+makeLabelable "typ loc"
 
-raise :: (Has Loc a, MonadError (Loc, e) m) => a -> e -> m r
-raise a e = throwError (π a, e)
+raise a e = throwError (a ^. loc, e)
+-- https://github.com/danielwaterworth/HList/blob/master/examples/labelable.hs
 
 -- -------------------- Doc formatting utils --------------------
 
