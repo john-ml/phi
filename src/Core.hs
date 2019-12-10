@@ -324,14 +324,42 @@ instance PP TCErr where
     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
     Custom s -> line $ D.fromList s
 
-type TC = ExceptT (P.SourcePos, TCErr) (Reader (Map Var Ty))
+type TC =
+  ExceptT (P.SourcePos, TCErr)
+  (Reader
+    ( Map Var (Ty, Bool) -- x ↦ (typeof x, x must basic block)
+    , Bool -- Whether or not we are in tail position
+    ))
 
-runTC' :: TC a -> Map Var Ty -> Either (P.SourcePos, TCErr) a
-runTC' m r = runExceptT m `runReader` r
+runTC' :: TC a -> Map Var (Ty, Bool) -> Bool -> Either (P.SourcePos, TCErr) a
+runTC' m r b = runExceptT m `runReader` (r, b)
 
 runTC :: TC a -> Either String a
-runTC m = first pretty $ runTC' m M.empty where
+runTC m = first pretty $ runTC' m M.empty True where
   pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err) M.empty
+
+untail :: TC a -> TC a
+untail = local (\ (env, _) -> (env, False))
+
+withBindings :: [Var] -> [Ty] -> [Bool] -> TC a -> TC a
+withBindings xs ts bs = local (\ (m, b) -> (M.fromList (zip xs (zip ts bs)) `M.union` m, b))
+
+withBinding :: Var -> Ty -> Bool -> TC a -> TC a
+withBinding x t b = local (first $ M.insert x (t, b))
+
+isTail :: TC Bool
+isTail = snd <$> ask
+
+find :: ParseAnn -> Var -> TC (Ty, Bool)
+find a x = (M.!? x) . fst <$> ask >>= \case
+  Just r -> return r
+  Nothing -> raise a $ NotInScope x
+
+typeof :: ParseAnn -> Var -> TC Ty
+typeof a x = fst <$> find a x
+
+isBB :: ParseAnn -> Var -> TC Bool
+isBB a x = snd <$> find a x
 
 check :: Exp ParseAnn -> Ty -> TC (Exp TyAnn)
 check exp ty = case exp of
@@ -380,9 +408,9 @@ checkPrim a es = \case
   Div -> checkNumOp a es
 
 var :: ParseAnn -> Var -> TC (Ty, Exp TyAnn)
-var a x = (M.!? x) <$> ask >>= \case
-  Just ty -> return $ (ty, Var (typ .==. ty .*. a) x)
-  Nothing -> raise a $ NotInScope x
+var a x = do
+  ty <- typeof a x
+  return $ (ty, Var (typ .==. ty .*. a) x)
 
 infer :: Exp ParseAnn -> TC (Ty, Exp TyAnn)
 infer = \case
@@ -397,7 +425,7 @@ infer = \case
     return (ty, Coerce (typ .==. ty .*. a) e' ty)
   Let a x t e1 e -> do
     e1' <- check e1 t
-    (ty, e') <- local (M.insert x t) (infer e)
+    (ty, e') <- withBinding x t False (infer e)
     return (ty, Let (typ .==. ty .*. a) x t e1' e')
   Call a e es -> infer e >>= \case
     (FPtr ts t, e') -> do
@@ -407,12 +435,14 @@ infer = \case
   Rec a funcs e -> do
     let fs = map (\ (Func _ f _ _ _) -> f) funcs
     let ts = map (\ (Func _ _ axts t _) -> FPtr (map (\ (_, _, t) -> t) axts) t) funcs
-    local (M.union . M.fromList $ zip fs ts) $ do
+    let bbs = fs $> False
+    withBindings fs ts bbs $ do
       funcs' <- forM funcs $ \ (Func a f axts t e) -> do
-        let xts = map (\ (_, x, t) -> (x, t)) axts
+        let xs = map (\ (_, x, _) -> x) axts
+        let ts = map (\ (_, _, t) -> t) axts
         let axts' = map (\ (a, x, t) -> (typ .==. Void .*. a, x, t)) axts
         current <- ask
-        e' <- local (M.union $ M.fromList xts) (check e t)
+        e' <- withBindings xs ts (ts $> False) (check e t)
         return $ Func (typ .==. Void .*. a) f axts' t e'
       (ty, e') <- infer e
       return (ty, Rec (typ .==. ty .*. a) funcs' e')
