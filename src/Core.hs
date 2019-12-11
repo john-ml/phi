@@ -724,10 +724,10 @@ sortedFVars = D.toList . go where
       goF (AFunc a f _ _ _) = (f, a^.fvSet)
       goAFunc (AFunc _ _ _ _ e) = go e
 
--- -- ...and determine whether each function should be an SSA block or a CFG.
+-- -------------------- Determine which functions should be BBs --------------------
 
-mapBBs :: CallGraph FVAnn -> [Component] -> BBs
-mapBBs graph vars = go vars `execState` S.empty where
+inferBBs :: CallGraph FVAnn -> [Component] -> BBs
+inferBBs graph vars = go vars `execState` S.empty where
   flow :: Var -> State BBs Bool
   flow caller = (caller ∉) <$> get <* modify' (S.insert caller)
   goVar :: Var -> State BBs Bool
@@ -752,6 +752,21 @@ mapBBs graph vars = go vars `execState` S.empty where
     SCC xs -> goSCC xs
   go :: [Component] -> State BBs ()
   go = mapM_ goComp
+
+-- -------------------- Check that BBs only called in tail position --------------------
+
+data BBErr = NotTail P.SourcePos
+
+instance Show BBErr where
+  show (NotTail pos) = P.sourcePosPretty pos ++ ": " ++ msg where
+    msg = "this function belongs in a basic block and can only be called in tail position"
+
+checkBBs :: CallGraph FVAnn -> BBs -> Either BBErr ()
+checkBBs graph bbs = forM_ bbs $ \ x ->
+  case graph M.!? x of
+    Just calls -> forM_ calls $ \ (FnCall {isTail, locOf}) ->
+      when (not isTail) . throwError $ NotTail locOf
+    Nothing -> return ()
 
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 

@@ -47,5 +47,42 @@ main = do
   let fvars = sortedFVars <$> tri''
   either putStrLn print graph
   either putStrLn print fvars
-  let bbs = liftA2 mapBBs graph fvars
+  let bbs = liftA2 inferBBs graph fvars
   either putStrLn print bbs
+  let mult = unlines
+       [ "rec mult(n: i32, m: i32): i32 ="
+       , "  rec go(n: i32, acc: i32): i32 ="
+       , "    case n {"
+       , "      0 => acc,"
+       , "      _ => go(sub(n, 1i32), add(m, acc))"
+       , "    }"
+       , "  in go(n, 0i32)"
+       , "in mult(10i32, 11i32)"
+       ]
+  either putStrLn (print' . ub) $ parse mult
+  testTC mult
+  let mult' = annoFV . toTails <$> toANF' mult
+  either putStrLn print' mult'
+  let graph = graphOf <$> mult'
+  let fvars = sortedFVars <$> mult'
+  either putStrLn print graph
+  either putStrLn print fvars
+  let bbs = liftA2 inferBBs graph fvars
+  either putStrLn print bbs
+  either putStrLn print (liftA2 checkBBs graph bbs)
+  let multBad = unlines
+       [ "rec mult(n: i32, m: i32): i32 ="
+       , "  rec go(n: i32, acc: i32): i32 ="
+       , "    case n {"
+       , "      0 => acc,"
+       , "      _ => add(go(sub(n, 1i32), add(m, acc)), 0i32)"
+       , "    }"
+       , "  in go(n, 0i32)"
+       , "in mult(10i32, 11i32)"
+       ]
+  let multBad' = annoFV . toTails <$> toANF' multBad
+  let graph = graphOf <$> multBad'
+  let fvars = sortedFVars <$> multBad'
+  let bbs = liftA2 inferBBs graph fvars
+  either putStrLn print bbs
+  either putStrLn print (liftA2 checkBBs graph bbs)
