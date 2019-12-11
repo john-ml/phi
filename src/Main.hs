@@ -7,6 +7,9 @@ print' x = print (x $> ())
 testTC :: String -> IO ()
 testTC s = either putStrLn print' $ (runTC . infer) =<< (ub <$> parse s)
 
+testANF :: String -> IO ()
+testANF s = either putStrLn print' $ (fmap (toANF . snd) . runTC . infer) =<< (ub <$> parse s)
+
 main = do
   either putStrLn print' $ parse "3i32"
   either putStrLn print' $ parse "let x: i32 = 3i32 in 4i32"
@@ -24,4 +27,4 @@ main = do
        ]
   either putStrLn (print' . ub) $ parse tri
   testTC tri
-
+  testANF tri

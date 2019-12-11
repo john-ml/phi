@@ -126,7 +126,20 @@ data Exp a
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
-makeLabelable "loc hasUB typ letsOnly callers"
+-- Every expression node has an annotation
+anno :: Exp a -> a
+anno = \case
+  Var a _ -> a
+  Int a _ _ -> a
+  Ann a _ _ -> a
+  Prim a _ _ -> a
+  Coerce a _ _ -> a
+  Let a _ _ _ _ -> a
+  Call a _ _ -> a
+  Case a _ _ -> a
+  Rec a _ _ -> a
+
+makeLabelable "loc hasUB typ"
 
 -- Parsing ==> ASTs are labelled with source locations
 type ParseFields = '[Tagged "loc" P.SourcePos]
@@ -138,21 +151,15 @@ type UBFields = Tagged "hasUB" HasUB : ParseFields
 -- After UB, type check and annotate nodes with their types
 type TyFields = Tagged "typ" Ty : UBFields
 
--- After UB, bind all intermediate values to variable names
-data LetsOnly = LetsOnly deriving Show
-type LetFields = Tagged "letsOnly" LetsOnly : TyFields
-
--- After let-binding everything, determine callers+actuals of every known function
-type Callers = Map Var (Exp LetAnn, [Exp LetAnn])
-type CallFields = Tagged "callers" Callers : LetFields
-
 type ParseAnn = Record ParseFields
 type UBAnn = Record UBFields
 type TyAnn = Record TyFields
-type LetAnn = Record LetFields
-type CallAnn = Record CallFields
 
 raise a e = throwError (a ^. loc, e)
+
+-- After TC, convert to ANF and determine callers+actuals of every known function
+type Callers = Map Var (Exp TyAnn, [Exp TyAnn])
+type CallFields = Tagged "callers" Callers : TyFields
 
 -- -------------------- Doc formatting utils --------------------
 
@@ -395,8 +402,8 @@ find a x = (M.!? x) . fst <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ NotInScope x
 
-typeof :: UBAnn -> Var -> TC Ty
-typeof a x = fst <$> find a x
+tcLookup :: UBAnn -> Var -> TC Ty
+tcLookup a x = fst <$> find a x
 
 isBB :: UBAnn -> Var -> TC Bool
 isBB a x = snd <$> find a x
@@ -412,17 +419,6 @@ check exp ty = case exp of
     (ty', exp')
       | ty' == ty -> return exp'
       | otherwise -> raise a $ ExGot ty ty'
-  where
-    anno = \case
-      Var a _ -> a
-      Int a _ _ -> a
-      Ann a _ _ -> a
-      Prim a _ _ -> a
-      Coerce a _ _ -> a
-      Let a _ _ _ _ -> a
-      Call a _ _ -> a
-      Case a _ _ -> a
-      Rec a _ _ -> a
 
 checkNumOp :: UBAnn -> [Exp UBAnn] -> TC (Ty, [Exp TyAnn])
 checkNumOp a = \case
@@ -449,7 +445,7 @@ checkPrim a es = \case
 
 var :: UBAnn -> Var -> TC (Ty, Exp TyAnn)
 var a x = do
-  ty <- typeof a x
+  ty <- tcLookup a x
   return $ (ty, Var (typ .==. ty .*. a) x)
 
 infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
@@ -511,24 +507,92 @@ infer = \case
 
 -- -------------------- Let binding every intermediate value --------------------
 
-lettify :: Exp TyAnn -> Exp LetAnn
-lettify e = fmap goAnn $ go e `evalState` maxUsed e where
-  goAnn :: TyAnn -> LetAnn
-  goAnn a = letsOnly .==. LetsOnly .*. a
-  go = \case
-    Var a x -> return $ Var a x
-    Int a i w -> return $ Int a i w
-    Ann a e ty -> Ann a <$> go e <*> pure ty
-    Coerce a e ty -> undefined
-    Let a x t e1 e -> undefined
-    -- Call a e es -> Call (goAnn a) <$> go e <*> mapM (go) es
-    -- Case a e pes ->
-    --   Case (goAnn a)
-    --     <$> go e
-    --     <*> mapM (\ (p :=> e) -> (p :=>) <$> go e) pes
-    -- Rec a helpers e -> undefined -- Rec (goAnn a) helpers <$> go e
+data Atom a
+  = AVar a Var
+  | AInt a Integer Width
+  deriving (THEUSUAL)
+
+newtype APath a = APath [AStep a] deriving (THEUSUAL)
+data AStep a
+  = AProj a Word -- extractvalue struct: e.n, n const
+  | AElemA a Word -- extractvalue array: e.[n], n const
+  | AElem (ANF a) -- extractelement: e<e>
+  | AIndex (ANF a) -- gep offset: e[e]
+  deriving (THEUSUAL)
+
+data AFunc a = AFunc a Var [(a, Var, Ty)] Ty (ANF a) deriving (THEUSUAL)
+data ANF a
+  = AHalt (Atom a)
+  | APrim a Var Ty Prim [Atom a] (ANF a)
+  | ACoerce a Var Ty (Atom a) (ANF a)
+  -- Control flow / name binding
+  | ACall a Var Ty (Atom a) [Atom a] (ANF a)
+  | ACase a (Atom a) [(Maybe Integer, ANF a)]
+  | ARec a [AFunc a] (ANF a) -- Function bundle
+  -- Aggregates
+  | ATuple a Var Ty [Atom a] (ANF a)
+  | AVector a Var Ty [Atom a] (ANF a)
+  | AGep a Var Ty (Atom a) (APath a) (ANF a) -- &e path (GEP)
+  | ALoad a Var Ty (Atom a) (APath a) (ANF a) -- e path (GEP+load, extractvalue, extractelement)
+  | AStore a (Atom a) (APath a) (Atom a) (ANF a) -- e path <- e; e (GEP+store)
+  | AUpdate a Var Ty (Atom a) (APath a) (ANF a) -- e with path = e (insertvalue, insertelement)
+  deriving (THEUSUAL)
+
+toANF :: Exp TyAnn -> ANF TyAnn
+toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt x) where
+  gen' = modify' (first succ) >> fst <$> get
+  push f = modify' (second (. f))
+  put' = modify' . second . const
+  get' = snd <$> get
+  go :: Map Var (Atom TyAnn) -> Exp TyAnn -> State (Var, ANF TyAnn -> ANF TyAnn) (Atom TyAnn)
+  go σ = \case
+    Var a x -> return $ σ ! (a, x)
+    Int a i w -> return $ AInt a i w
+    Ann _ e _ -> go σ e -- We have type annotations already
+    Prim a p es -> do
+      es' <- mapM (go σ) es
+      x <- gen'
+      push $ APrim a x (a^.typ) p es'
+      return $ AVar a x
+    Coerce a e ty -> do
+      e' <- go σ e
+      x <- gen'
+      push $ ACoerce a x ty e'
+      return $ AVar a x
+    Let a x t e1 e -> do
+      e1' <- go σ e1
+      go (M.insert x e1' σ) e
+    Call a e es -> do
+      e' <- go σ e
+      es' <- mapM (go σ) es
+      x <- gen'
+      push $ ACall a x (a^.typ) e' es'
+      return $ AVar a x
+    Case a e pes -> do
+      e' <- go σ e
+      k <- get' <* put' id
+      pes' <- forM pes $ \ (p :=> e1) -> do
+        e1' <- go σ e1
+        k <- get'
+        return (p, k (AHalt e1'))
+      put' $ const (k (ACase a e' pes'))
+      return $ error "Tried to inspect return value of Case"
+    Rec a helpers e -> do
+      k <- get' <* put' id
+      helpers' <- forM helpers $ \ (Func a f axts t e1) -> do
+        e1' <- go σ e1
+        k <- get'
+        return (AFunc a f axts t (k (AHalt e1')))
+      put' $ k . ARec a helpers'
+      go σ e
     -- Tuple a es -> Tuple (goAnn a) <$> mapM go es
     -- Vector a es -> Vector (goAnn a) <$> mapM go es
+    where
+      σ ! (a, x) = M.findWithDefault (AVar a x) x σ
+
+-- Once lebelled, every expression node has a type
+typeof :: Exp TyAnn -> Ty
+typeof e = anno e ^. typ
 
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 
