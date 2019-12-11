@@ -10,22 +10,13 @@ import qualified Data.Foldable as F
 import Data.Bifunctor
 import Data.Functor
 import Data.Maybe
--- import Data.Functor.Foldable
--- import Data.Functor.Foldable.TH
--- import Data.Functor.Classes
--- import Data.Functor.Compose
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Writer.Strict
--- import Control.Monad.Trans.Maybe
 import Control.Applicative
--- import Text.Show.Deriving
--- 
--- import Data.SBV
--- import qualified Data.SBV.Internals as SBVI
--- 
+
 import Data.String (IsString (..))
 import Data.DList (DList); import qualified Data.DList as D
 
@@ -180,14 +171,12 @@ type CallGraph a = Map Var (Set (FnCall a))
 -- ...and determine whether each function should be an SSA block or a CFG.
 type BBs = Set Var
 
--- -------------------- Doc formatting utils --------------------
+-- -------------------- Doc formatting utils/pretty printers --------------------
 
 type Str = DList Char -- For efficient catenation
 
--- Indentation + φ sets as input
--- Phi sets represented as f ↦ x ↦ actuals
-type Usages = Map Var (Map Var (Set Var))
-type Doc = Reader (Str, Usages) Str
+-- Indentation as input
+type Doc = Reader Str Str
 deriving instance Semigroup a => Semigroup (Reader r a)
 deriving instance Monoid a => Monoid (Reader r a)
 
@@ -197,19 +186,19 @@ show' = D.fromList . show
 show'' :: Show a => a -> Doc
 show'' = pure . show'
 
-runDoc :: Doc -> Usages -> String
-runDoc c usages = D.toList $ c `runReader` ("", usages)
+runDoc :: Doc -> String
+runDoc c = D.toList $ c `runReader` ""
 
 instance IsString Doc where fromString = pure . D.fromList
 
 indent :: Doc -> Doc
-indent = local (first ("  " <>))
+indent = local ("  " <>)
 
 line :: Str -> Doc
-line l = reader $ \ (s, _) -> s <> l <> "\n"
+line l = reader $ \ s -> s <> l <> "\n"
 
 line' :: Doc -> Doc
-line' l = reader $ \ r@(s, _) -> s <> runReader l r <> "\n"
+line' l = reader $ \ s -> s <> runReader l s <> "\n"
 
 calate :: Doc -> [Doc] -> Doc
 calate sep ds = F.fold (L.intersperse sep ds)
@@ -250,55 +239,6 @@ instance PP Prim where
     Div -> "div"
 
 instance PP (Exp a) where pp = undefined
---   pp = \case
---     AVar _ x -> show'' x
---     AInt _ i w -> show'' i <> "i" <> show'' w
---     ATuple _ es -> "{" <> commaSep (map pp es) <> "}"
---     AVector _ es -> "{" <> commaSep (map pp es) <> "}"
---     AUpdate _ e1 p e2 -> pp e1 <> " {" <> calate "." (show'' <$> p) <> " = " <> pp e2 <> "}"
---     ACoerce _ e t -> pp e <> " as " <> pp t
---     ABinop _ e1 o e2 -> "(" <> pp e1 <> " " <> pp o <> " " <> pp e2 <> ")"
---     ALet _ x t e1 e -> F.fold
---       [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
---       , indent (pp e1)
---       , line $ " in "
---       , pp e
---       ]
---     ACall _ e es -> pp e <> "(" <> commaSep (map pp es) <> ")"
---     AGep _ e p -> "&" <> pp e -- TODO
---     ALoad _ e -> "*" <> pp e
---     AStore _ d s e -> F.fold
---       [ line' $ pp d <> " := " <> pp s <> ";"
---       , pp e
---       ]
---     ARec _ fs e -> undefined -- TODO
---     ACase _ e d pes -> undefined -- TODO
---     AAnn _ e ty -> "(" <> pp e <> " : " <> pp ty <> ")"
-
--- data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (Eq, Ord, Show)
--- 
--- -- Expressions
--- data Arm a = Maybe Integer :=> Exp a deriving (Eq, Ord, Show)
--- data Exp a
---   -- Primitives
---   = Var a Var
---   | Int a Integer Width
---   | Ann a (Exp a) Ty
---   | Prim a Prim [Exp a]
---   | Coerce a (Exp a) Ty
---   | Let a Var Ty (Exp a) (Exp a)
---   -- Control flow / name binding
---   | Call a (Exp a) [Exp a]
---   | Case a (Exp a) [Arm a]
---   | Rec a [Func a] (Exp a) -- Function bundle
---   -- Aggregates
---   | Tuple a [Exp a]
---   | Vector a [Exp a]
---   | Gep a (Exp a) (Path a) -- &e path (GEP)
---   | Load a (Exp a) (Path a) -- e path (GEP+load, extractvalue, extractelement)
---   | Store a (Exp a) (Path a) (Exp a) (Exp a) -- e path <- e; e (GEP+store)
---   | Update a (Exp a) (Path a) (Exp a) -- e with path = e (insertvalue, insertelement)
---   deriving (Eq, Ord, Show)
 
 -- -------------------- Variables --------------------
 
@@ -323,10 +263,6 @@ foldVars f = \case
       f f' <> foldMap (\ (_, x, _) -> f x) axts <> foldVars f e
   Tuple _ es -> foldMap (foldVars f) es
   Vector _ es -> foldMap (foldVars f) es
-  -- Gep _ e p -> foldVars f e -- TODO
-  -- Load _ e -> foldVars f e
-  -- Store _ d s e -> foldVars f d <> foldVars f s <> foldVars f e
-  -- Update _ e1 _ e2 -> foldVars f e1 <> foldVars f e2
 
 -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
 maxUsed :: Exp a -> Var
@@ -368,10 +304,6 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
       Rec a helpers' <$> go σ' e
     Tuple a es -> Tuple a <$> mapM (go σ) es
     Vector a es -> Vector a <$> mapM (go σ) es
-    -- Gep a e p -> AGep a <$> go σ e <*> pure p -- TODO
-    -- Load a e -> ALoad a <$> go σ e
-    -- Store a d s e -> AStore a <$> go σ d <*> go σ s <*> go σ e
-    -- Update a e1 p e2 -> AUpdate a <$> go σ e1 <*> pure p <*> go σ e2
   σ ! x = M.findWithDefault x x σ
 
 -- -------------------- Type checking --------------------
@@ -399,7 +331,7 @@ runTC' m r = runExceptT m `runReader` r
 
 runTC :: TC a -> Either String a
 runTC m = first pretty $ runTC' m M.empty where
-  pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err) M.empty
+  pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err)
 
 withBindings :: [Var] -> [Ty] -> TC a -> TC a
 withBindings xs ts = local (M.union . M.fromList $ zip xs ts)
@@ -485,28 +417,6 @@ infer = \case
         return $ Func (typ .==. Void .*. a) f axts' t e'
       (ty, e') <- infer e
       return (ty, Rec (typ .==. ty .*. a) funcs' e')
---   ATuple a es -> do
---     es' <- mapM infer es
---     return $ ATuple (Tup (map (\ (AnnoTy t) -> t) es'), a) es'
---   AVector a es -> do
---     es' <- mapM infer es
---     return $ AVector (Vec (map (\ (AnnoTy t) -> t) es'), a) es'
---   AUpdate a e1 _ e2 -> undefined -- TODO
---   ACoerce a e t -> ACoerce (t, a) <$> infer e <*> pure t
---   ABinop a e1 o e2@(Anno a2) -> (,) <$> infer e1 <*> infer e2 >>= \case
---     (AnnTy e1' t1, AnnTy e2' t2)
---       | t1 == t2 -> return $ ABinop (t1, a) e1' o e2'
---       | otherwise -> raise a2 $ ExGot t1 t2
---   AGep a e p -> undefined -- TODO
---   ALoad a e -> infer e >>= \case
---     AnnTy e' (Prim (Ptr t)) -> return $ ALoad (t, a) e'
---     AnnoTy ty -> raise a $ ExGotShape "pointer" ty
---   AStore a d s e -> infer d >>= \case
---     AnnTy d' (Prim (Ptr t)) -> do
---       s' <- check s t
---       AnnTy e' ty <- infer e
---       return $ AStore (ty, a) d' s' e'
---     AnnoTy ty -> raise a $ ExGotShape "pointer" ty
 
 -- -------------------- Conversion to ANF --------------------
 
@@ -768,150 +678,6 @@ checkBBs graph bbs = forM_ bbs $ \ x ->
       when (not isTail) . throwError $ NotTail locOf
     Nothing -> return ()
 
--- -- -- -------------------- Code generation utils --------------------
--- -- 
--- -- varG :: Var -> Doc
--- -- varG x = (M.! x) . fst <$> ask >>= \case
--- --   Rbx -> pure "rbx"
--- --   R12 -> pure "r12"
--- --   R13 -> pure "r13"
--- --   R14 -> pure "r14"
--- --   R15 -> pure "r15"
--- --   Spill n -> pure $ "spill" <> show' n
--- -- 
--- -- declG :: Str -> Var -> Doc
--- -- declG ty x = (M.! x) . fst <$> ask >>= \case
--- --   Spill _ -> pure ty <> " " <> varG x
--- --   _ -> varG x
--- -- 
--- -- procG :: Doc -> Doc -> Doc
--- -- procG name body = F.fold
--- --   [ line' ("void " <> name <> "(void) {")
--- --   , indent body
--- --   , indent $ line "asm (\"jmp gt_stop\\t\\n\");"
--- --   , line "}"
--- --   ]
--- -- 
--- -- spillProcG :: Set Var -> Doc -> Doc -> Doc
--- -- spillProcG spilled name body = procG name $ F.fold
--- --   [ line "gt_ch *rsp = (gt_ch *)gt_self()->rsp + 1;"
--- --   , F.fold . for2 [0..] (S.toAscList spilled) $ \ offset x ->
--- --       line' $ "gt_ch " <> varG x <> " = rsp[" <> show'' offset <> "];"
--- --   , body
--- --   ]
--- -- 
--- -- mainG :: Doc -> Doc
--- -- mainG body = F.fold
--- --   [ line "int main(void) {"
--- --   , indent $ F.fold
--- --     [ line "gt_init();"
--- --     , body
--- --     , line "gt_exit(0);"
--- --     ]
--- --   , line "}"
--- --   ]
--- 
--- -- -------------------- Code generation --------------------
--- 
--- varG :: Var -> Doc
--- varG x = "%" <> show'' x
--- 
--- binopG :: Binop -> Doc
--- binopG = \case
---   Add -> "add"
---   Mul -> "mul"
---   Sub -> "sub"
---   Div -> "div"
--- 
--- type Gen =
---   ReaderT (Map Var (Set Var)) -- Rec functions ↦ formals
---   (StateT (Var, Doc, Map Var (Map Var (Set Var))) -- Fresh names, current body, rec function ↦ formal ↦ actuals
---   (Writer Doc)) -- Global definitions
--- 
--- fresh :: Gen Var
--- fresh = get <* modify' succ
--- 
--- gensym :: Doc -> Gen Doc
--- gensym name = ("%" <>) . (name <>) . show'' <$> fresh
--- 
--- voidG :: Doc -> Gen Var
--- voidG instr = do
---   x <- fresh
---   tell (mempty, line' $ instr)
---   return x
--- 
--- instrG :: Doc -> Gen Var
--- instrG instr = do
---   x <- fresh
---   tell (mempty, line' $ varG x <> " = " <> instr)
---   return x
--- 
--- expG :: Has Ty a => Exp a -> Gen Var
--- expG = \case
---   AVar _ x -> return x
---   AInt (π -> ty :: Ty) i _ -> instrG $ "add " <> pp ty <> " 0, " <> show'' i
---   ATuple (π -> ty :: Ty) es -> do
---     let ty' = pp ty
---     p <- fmap varG . instrG $ "alloca " <> ty'
---     r <- instrG $ "load " <> ty' <> ", " <> pp (Prim (Ptr ty)) <> " " <> p
---     acciM es r $ \ i (varG -> r') e@(Anno (π -> t :: Ty)) -> do
---       e' <- varG <$> expG e
---       instrG $ "insertvalue " <> ty' <> " " <> r' <> ", " <> pp t <> " " <> e' <> ", " <> show'' i
---   AVector (π -> ty :: Ty) es -> undefined -- TODO
---   -- AUpdate _ e1 p e2 -> pp e1 <> " {" <> calate "." (show'' <$> p) <> " = " <> pp e2 <> "}"
---   ACoerce _ e t -> undefined -- TODO
---   ABinop (π -> ty :: Ty) e1 o e2 -> do
---     e1' <- varG <$> expG e1
---     e2' <- varG <$> expG e2
---     instrG $ binopG o <> " " <> pp ty <> " " <> e1' <> ", " <> e2'
---   ALet (π -> ty :: Ty) x t e1 e -> do
---     e1' <- varG <$> expG e1
---     let ty' = pp ty
---     p <- fmap varG . instrG $ "alloca " <> ty'
---     voidG $ "store " <> ty' <> " " <> e1' <> ", " <> pp (Prim (Ptr ty)) <> " " <> p
---     voidG $ varG x <> " = load " <> ty' <> ", " <> pp (Prim (Ptr ty)) <> " " <> p
---     expG e
---   ACall (π -> ty :: Ty) e es -> do
---     e' <- expG e
---     es' <- mapM (fmap varG . expG) es
---     (e' ∈) <$> ask >>= \case
---       True -> voidG $ "br label " <> varG e'
---       False -> instrG $ "call " <> pp ty <> " " <> varG e' <> "(" <> commaSep es' <> ")"
---   AGep _ e p -> undefined -- TODO
---   ALoad (π -> ty :: Ty) e -> do
---     let ty' = pp ty
---     e' <- varG <$> expG e
---     instrG $ "load " <> ty' <> ", " <> ty' <> " " <> e'
---   AStore _ d s@(Anno (π -> ts :: Ty)) e -> do
---     d' <- varG <$> expG d
---     s' <- varG <$> expG s
---     voidG $ "store " <> pp ts <> " " <> s' <> ", " <> pp (Prim (Ptr ts)) <> " " <> d'
---     expG e
---   ARec _ fs e -> undefined -- TODO
---   ACase _ e d pes -> undefined -- TODO
--- 
--- -- genTop :: AnnProcess -> Gen Doc
--- -- genTop (FV vs p) = do
--- --   tell $ line "#include <stdlib.h>"
--- --   tell $ line "#include \"runtime.c\""
--- --   mainG <$> expG (ABoth (vs, Any False) (AHalt (S.empty, Any False)) p)
--- -- 
--- -- runGen :: Alloc -> Gen Doc -> String
--- -- runGen alloc m =
--- --   let (main, helpers) = runWriter $ m `runReaderT` alloc `evalStateT` 0 in
--- --   runDoc alloc (helpers <> main)
--- -- 
--- -- -- -------------------- AST Compilation --------------------
--- -- 
--- -- codeGen' :: Bool -> Process -> IO String
--- -- codeGen' sinking p = do
--- --   let p' = (if sinking then sinkNews else id) . fvAnno $ ub p
--- --   a <- alloc p'
--- --   return $ runGen a (genTop p')
--- -- 
--- -- codeGen :: Process -> IO String
--- -- codeGen = codeGen' True
--- -- 
 -- -------------------- Parsing utils --------------------
 
 newtype PError = PError String deriving (Eq, Ord)
