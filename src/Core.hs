@@ -1,5 +1,6 @@
 module Core where
 
+import Debug.Trace
 import Data.Set (Set); import qualified Data.Set as S
 import Data.Map.Strict (Map); import qualified Data.Map.Strict as M
 
@@ -39,6 +40,8 @@ import Util
 import Data.HList.CommonMain
 import Control.Lens
 
+#define THEUSUAL Eq, Ord, Show, Functor, Foldable, Traversable
+
 -- -------------------- Object language --------------------
 
 -- Primitives
@@ -70,22 +73,22 @@ data Ty
 -- LLVM's version of C's a[i] is gep + load.
 
 -- Access paths
-type Path a = [Step a]
+newtype Path a = Path [Step a] deriving (THEUSUAL)
 data Step a
   = Proj a Word -- extractvalue struct: e.n, n const
   | ElemA a Word -- extractvalue array: e.[n], n const
   | Elem (Exp a) -- extractelement: e<e>
   | Index (Exp a) -- gep offset: e[e]
-  deriving (Eq, Ord, Show)
+  deriving (THEUSUAL)
 
 type Var = Word
 type Width = Word
 
 -- Local function definition
-data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (Eq, Ord, Show)
+data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (THEUSUAL)
 
 -- Expressions
-data Arm a = Maybe Integer :=> Exp a deriving (Eq, Ord, Show)
+data Arm a = Maybe Integer :=> Exp a deriving (THEUSUAL)
 data Exp a
   -- Primitives
   = Var a Var
@@ -105,14 +108,16 @@ data Exp a
   | Load a (Exp a) (Path a) -- e path (GEP+load, extractvalue, extractelement)
   | Store a (Exp a) (Path a) (Exp a) (Exp a) -- e path <- e; e (GEP+store)
   | Update a (Exp a) (Path a) (Exp a) -- e with path = e (insertvalue, insertelement)
-  deriving (Eq, Ord, Show)
+  deriving (THEUSUAL)
 
 -- Since this is LLVM and not λ-calculus, every function must satisfy some conditions
 -- so that they can be implemented as SSA blocks using φ-nodes instead of closures.
--- - A function f "needs" variable x if, assuming UB,
+-- - All functions f where some variables are live upon entry to f (i.e., f itself
+--   closes over those variables or calls functions which do) must become SSA blocks.
+-- - Specifically, x is live at f if, assuming UB,
 --   (1) x ∈ FV(body of f) or
---   (2) f calls g, g needs x, and x ∉ BV(body of f).
--- - All calls to functions which need variables must be in tail position.
+--   (2) f calls g, x is live at g, and x ∉ BV(body of f).
+-- - All calls to SSA-block functions must be in tail position.
 -- - These tail calls will become `br` instructions and the corresponding functions
 --   will become SSA blocks with φ-nodes.
 -- - Functions which don't need variables become global functions.
@@ -121,10 +126,31 @@ data Exp a
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
-makeLabelable "typ loc"
+makeLabelable "loc hasUB typ letsOnly callers"
 
-type ParseAnn = Record '[Tagged "loc" P.SourcePos]
-type TyAnn = Record '[Tagged "typ" Ty, Tagged "loc" P.SourcePos]
+-- Parsing ==> ASTs are labelled with source locations
+type ParseFields = '[Tagged "loc" P.SourcePos]
+
+-- After parsing, make bindings unique
+data HasUB = HasUB deriving Show
+type UBFields = Tagged "hasUB" HasUB : ParseFields
+
+-- After UB, type check and annotate nodes with their types
+type TyFields = Tagged "typ" Ty : UBFields
+
+-- After UB, bind all intermediate values to variable names
+data LetsOnly = LetsOnly deriving Show
+type LetFields = Tagged "letsOnly" LetsOnly : TyFields
+
+-- After let-binding everything, determine callers+actuals of every known function
+type Callers = Map Var (Exp LetAnn, [Exp LetAnn])
+type CallFields = Tagged "callers" Callers : LetFields
+
+type ParseAnn = Record ParseFields
+type UBAnn = Record UBFields
+type TyAnn = Record TyFields
+type LetAnn = Record LetFields
+type CallAnn = Record CallFields
 
 raise a e = throwError (a ^. loc, e)
 
@@ -222,91 +248,105 @@ instance PP (Exp a) where pp = undefined
 --     ARec _ fs e -> undefined -- TODO
 --     ACase _ e d pes -> undefined -- TODO
 --     AAnn _ e ty -> "(" <> pp e <> " : " <> pp ty <> ")"
+
+-- data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (Eq, Ord, Show)
 -- 
--- -- -------------------- Variables --------------------
--- 
--- -- Generic fold over variables
--- foldVars :: Monoid m => (Var -> m) -> Exp a -> m
--- foldVars f = \case
---   AVar _ x -> f x
---   AInt _ _ _ -> mempty
---   ATuple _ es -> foldMap (foldVars f) es
---   AVector _ es -> foldMap (foldVars f) es
---   AUpdate _ e1 _ e2 -> foldVars f e1 <> foldVars f e2
---   ACoerce _ e _ -> foldVars f e
---   ABinop _ e1 _ e2 -> foldVars f e1 <> foldVars f e2
---   ALet _ x _ e1 e -> f x <> foldVars f e1 <> foldVars f e
---   ACall _ e es -> foldVars f e <> foldMap (foldVars f) es
---   AGep _ e p -> foldVars f e -- TODO
---   ALoad _ e -> foldVars f e
---   AStore _ d s e -> foldVars f d <> foldVars f s <> foldVars f e
---   ARec _ fs e ->
---     foldMap (\ (AFunc _ f' xts _ e) -> f f' <> foldMap (f . fst) xts <> foldVars f e) fs <>
---     foldVars f e
---   ACase _ e d pes ->
---     foldVars f e <> foldVars f d <> foldMap (\ (_ :=> e) -> foldVars f e) pes
---   AAnn _ e _ -> foldVars f e
--- 
--- -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
--- maxUsed :: Exp a -> Var
--- maxUsed = getMax . foldVars Max
--- 
--- -- Used variables
--- uv :: Exp a -> Set Var
--- uv = foldVars S.singleton
--- 
--- -- Rename bound variables for unique bindings
--- ub :: Exp a -> Exp a
--- ub p = go M.empty p `evalState` maxUsed p where
---   go σ = \case
---     AVar a x -> return $ AVar a (σ ! x)
---     AInt a i w -> return $ AInt a i w
---     ATuple a es -> ATuple a <$> mapM (go σ) es
---     AVector a es -> AVector a <$> mapM (go σ) es
---     AUpdate a e1 p e2 -> AUpdate a <$> go σ e1 <*> pure p <*> go σ e2
---     ACoerce a e t -> ACoerce a <$> go σ e <*> pure t
---     ABinop a e1 (·) e2 -> ABinop a <$> go σ e1 <*> pure (·) <*> go σ e2
---     ALet a x t e1 e -> do x' <- gen; ALet a x' t <$> go σ e1 <*> go (M.insert x x' σ) e
---     ACall a e es -> ACall a <$> go σ e <*> mapM (go σ) es
---     AGep a e p -> AGep a <$> go σ e <*> pure p -- TODO
---     ALoad a e -> ALoad a <$> go σ e
---     AStore a d s e -> AStore a <$> go σ d <*> go σ s <*> go σ e
---     ARec a helpers e -> do
---       let fs = map (\ (AFunc _ f _ _ _) -> f) helpers
---       fs' <- replicateM (length fs) gen
---       let σ' = foldr (uncurry M.insert) σ (zip fs fs')
---       helpers' <- forM helpers $ \ (AFunc a f xts t e) -> do
---         let xs = map fst xts
---         xs' <- replicateM (length xts) gen
---         let σ'' = foldr (uncurry M.insert) σ' (zip xs xs')
---         AFunc a (σ ! f) (zip xs' (map snd xts)) t <$> go σ'' e
---       ARec a helpers' <$> go σ' e
---     ACase a e d pes ->
---       ACase a
---         <$> go σ e <*> go σ d
---         <*> mapM (\ (p :=> e) -> (p :=>) <$> go σ e) pes
---     AAnn a e ty -> AAnn a <$> go σ e <*> pure ty
---   σ ! x = M.findWithDefault x x σ
---   gen = modify' succ *> get
--- 
--- -- -- Free variables
--- -- fvF :: Base Process (Set Var) -> Set Var
--- -- fvF = \case
--- --   HaltF -> S.empty
--- --   NewF x vs -> S.delete x vs
--- --   SendF s d vs -> S.insert s (S.insert d vs)
--- --   RecvF d s vs -> S.insert s (S.delete d vs)
--- --   EvalF x e vs -> foldMap S.singleton e ∪ S.delete x vs
--- --   DoF e vs -> foldMap S.singleton e
--- --   vs :|:$ ws -> vs ∪ ws
--- --   vs :+:$ ws -> vs ∪ ws
--- --   LoopF vs -> vs
--- --   MatchF x (L.unzip -> (xs, vss)) -> S.fromList (x : xs) ∪ F.fold vss
--- --   ForeignF _ vs -> vs
--- -- 
--- -- fv :: Process -> Set Var
--- -- fv = cata fvF
--- -- 
+-- -- Expressions
+-- data Arm a = Maybe Integer :=> Exp a deriving (Eq, Ord, Show)
+-- data Exp a
+--   -- Primitives
+--   = Var a Var
+--   | Int a Integer Width
+--   | Ann a (Exp a) Ty
+--   | Prim a Prim [Exp a]
+--   | Coerce a (Exp a) Ty
+--   | Let a Var Ty (Exp a) (Exp a)
+--   -- Control flow / name binding
+--   | Call a (Exp a) [Exp a]
+--   | Case a (Exp a) [Arm a]
+--   | Rec a [Func a] (Exp a) -- Function bundle
+--   -- Aggregates
+--   | Tuple a [Exp a]
+--   | Vector a [Exp a]
+--   | Gep a (Exp a) (Path a) -- &e path (GEP)
+--   | Load a (Exp a) (Path a) -- e path (GEP+load, extractvalue, extractelement)
+--   | Store a (Exp a) (Path a) (Exp a) (Exp a) -- e path <- e; e (GEP+store)
+--   | Update a (Exp a) (Path a) (Exp a) -- e with path = e (insertvalue, insertelement)
+--   deriving (Eq, Ord, Show)
+
+-- -------------------- Variables --------------------
+
+-- Useful for generating fresh variable
+gen :: MonadState Var m => m Var
+gen = modify' succ *> get
+
+-- Generic fold over variables
+foldVars :: Monoid m => (Var -> m) -> Exp a -> m
+foldVars f = \case
+  Var _ x -> f x
+  Int _ _ _ -> mempty
+  Ann _ e _ -> foldVars f e
+  Prim _ _ es -> foldMap (foldVars f) es
+  Coerce _ e _ -> foldVars f e
+  Let _ x _ e1 e -> f x <> foldVars f e1 <> foldVars f e
+  Call _ e es -> foldVars f e <> foldMap (foldVars f) es
+  Case _ e pes ->
+    foldVars f e <> foldMap (\ (_ :=> e) -> foldVars f e) pes
+  Rec _ fs e -> foldMap foldFunc fs <> foldVars f e where
+    foldFunc (Func _ f' axts _ e) =
+      f f' <> foldMap (\ (_, x, _) -> f x) axts <> foldVars f e
+  Tuple _ es -> foldMap (foldVars f) es
+  Vector _ es -> foldMap (foldVars f) es
+  -- Gep _ e p -> foldVars f e -- TODO
+  -- Load _ e -> foldVars f e
+  -- Store _ d s e -> foldVars f d <> foldVars f s <> foldVars f e
+  -- Update _ e1 _ e2 -> foldVars f e1 <> foldVars f e2
+
+-- Smallest variable v such that {v + 1, v + 2, ..} are all unused
+maxUsed :: Exp a -> Var
+maxUsed = getMax . foldVars Max
+
+-- Used variables
+uv :: Exp a -> Set Var
+uv = foldVars S.singleton
+
+-- Rename bound variables for unique bindings
+ub :: Exp ParseAnn -> Exp UBAnn
+ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
+  goAnn :: ParseAnn -> UBAnn
+  goAnn a = hasUB .==. HasUB .*. a
+  go σ = \case
+    Var a x -> return $ Var a (σ ! x)
+    Int a i w -> return $ Int a i w
+    Ann a e ty -> Ann a <$> go σ e <*> pure ty
+    Prim a p es -> Prim a p <$> mapM (go σ) es
+    Coerce a e t -> Coerce a <$> go σ e <*> pure t
+    Let a x t e1 e -> do
+      x' <- gen
+      Let a x' t <$> go σ e1 <*> go (M.insert x x' σ) e
+    Call a e es -> Call a <$> go σ e <*> mapM (go σ) es
+    Case a e pes ->
+      Case a
+        <$> go σ e
+        <*> mapM (\ (p :=> e) -> (p :=>) <$> go σ e) pes
+    Rec a helpers e -> do
+      let fs = map (\ (Func _ f _ _ _) -> f) helpers
+      fs' <- replicateM (length fs) gen
+      let σ' = M.fromList (zip fs fs') `M.union` σ
+      helpers' <- forM helpers $ \ (Func a f axts t e) -> do
+        let xs = map (\ (_, x, _) -> x) axts
+        xs' <- replicateM (length axts) gen
+        let axts' = zipWith (\ x' (a, _, t) -> (a, x', t)) xs' axts
+        let σ'' = M.fromList (zip xs xs') `M.union` σ'
+        Func a (σ' ! f) axts' t <$> go σ'' e
+      Rec a helpers' <$> go σ' e
+    Tuple a es -> Tuple a <$> mapM (go σ) es
+    Vector a es -> Vector a <$> mapM (go σ) es
+    -- Gep a e p -> AGep a <$> go σ e <*> pure p -- TODO
+    -- Load a e -> ALoad a <$> go σ e
+    -- Store a d s e -> AStore a <$> go σ d <*> go σ s <*> go σ e
+    -- Update a e1 p e2 -> AUpdate a <$> go σ e1 <*> pure p <*> go σ e2
+  σ ! x = M.findWithDefault x x σ
 
 -- -------------------- Type checking --------------------
 
@@ -350,18 +390,18 @@ withBinding x t b = local (first $ M.insert x (t, b))
 isTail :: TC Bool
 isTail = snd <$> ask
 
-find :: ParseAnn -> Var -> TC (Ty, Bool)
+find :: UBAnn -> Var -> TC (Ty, Bool)
 find a x = (M.!? x) . fst <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ NotInScope x
 
-typeof :: ParseAnn -> Var -> TC Ty
+typeof :: UBAnn -> Var -> TC Ty
 typeof a x = fst <$> find a x
 
-isBB :: ParseAnn -> Var -> TC Bool
+isBB :: UBAnn -> Var -> TC Bool
 isBB a x = snd <$> find a x
 
-check :: Exp ParseAnn -> Ty -> TC (Exp TyAnn)
+check :: Exp UBAnn -> Ty -> TC (Exp TyAnn)
 check exp ty = case exp of
   Case a e pes -> infer e >>= \case
     (PTy (I _), e') -> do
@@ -384,7 +424,7 @@ check exp ty = case exp of
       Case a _ _ -> a
       Rec a _ _ -> a
 
-checkNumOp :: ParseAnn -> [Exp ParseAnn] -> TC (Ty, [Exp TyAnn])
+checkNumOp :: UBAnn -> [Exp UBAnn] -> TC (Ty, [Exp TyAnn])
 checkNumOp a = \case
   [] -> raise a . Custom $ "Expected at least one argument"
   (e:es) -> do
@@ -400,19 +440,19 @@ checkNumOp a = \case
       PTy Double -> True
       PTy FP128 -> True
 
-checkPrim :: ParseAnn -> [Exp ParseAnn] -> Prim -> TC (Ty, [Exp TyAnn])
+checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
 checkPrim a es = \case
   Add -> checkNumOp a es
   Mul -> checkNumOp a es
   Sub -> checkNumOp a es
   Div -> checkNumOp a es
 
-var :: ParseAnn -> Var -> TC (Ty, Exp TyAnn)
+var :: UBAnn -> Var -> TC (Ty, Exp TyAnn)
 var a x = do
   ty <- typeof a x
   return $ (ty, Var (typ .==. ty .*. a) x)
 
-infer :: Exp ParseAnn -> TC (Ty, Exp TyAnn)
+infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
 infer = \case
   Var a x -> var a x
   Int a i w -> let t = PTy (I w) in return (t, Int (typ .==. t .*. a) i w)
@@ -435,7 +475,7 @@ infer = \case
   Rec a funcs e -> do
     let fs = map (\ (Func _ f _ _ _) -> f) funcs
     let ts = map (\ (Func _ _ axts t _) -> FPtr (map (\ (_, _, t) -> t) axts) t) funcs
-    let bbs = fs $> False
+    let bbs = fs $> False -- TODO
     withBindings fs ts bbs $ do
       funcs' <- forM funcs $ \ (Func a f axts t e) -> do
         let xs = map (\ (_, x, _) -> x) axts
@@ -468,6 +508,27 @@ infer = \case
 --       AnnTy e' ty <- infer e
 --       return $ AStore (ty, a) d' s' e'
 --     AnnoTy ty -> raise a $ ExGotShape "pointer" ty
+
+-- -------------------- Let binding every intermediate value --------------------
+
+lettify :: Exp TyAnn -> Exp LetAnn
+lettify e = fmap goAnn $ go e `evalState` maxUsed e where
+  goAnn :: TyAnn -> LetAnn
+  goAnn a = letsOnly .==. LetsOnly .*. a
+  go = \case
+    Var a x -> return $ Var a x
+    Int a i w -> return $ Int a i w
+    Ann a e ty -> Ann a <$> go e <*> pure ty
+    Coerce a e ty -> undefined
+    Let a x t e1 e -> undefined
+    -- Call a e es -> Call (goAnn a) <$> go e <*> mapM (go) es
+    -- Case a e pes ->
+    --   Case (goAnn a)
+    --     <$> go e
+    --     <*> mapM (\ (p :=> e) -> (p :=>) <$> go e) pes
+    -- Rec a helpers e -> undefined -- Rec (goAnn a) helpers <$> go e
+    -- Tuple a es -> Tuple (goAnn a) <$> mapM go es
+    -- Vector a es -> Vector (goAnn a) <$> mapM go es
 
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 
