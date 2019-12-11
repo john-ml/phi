@@ -1,5 +1,6 @@
 import Core
 import Data.Functor
+import Control.Applicative
 
 print' :: (Functor f, Show (f ())) => f a -> IO ()
 print' x = print (x $> ())
@@ -42,5 +43,9 @@ main = do
   either putStrLn print' tri'
   let tri'' = annoFV . toTails <$> tri'
   either putStrLn print' tri''
-  either putStrLn print (graphOf <$> tri'')
-  either putStrLn print (sortedVars <$> tri'')
+  let graph = graphOf <$> tri''
+  let fvars = sortedFVars <$> tri''
+  either putStrLn print graph
+  either putStrLn print fvars
+  let bbs = liftA2 mapBBs graph fvars
+  either putStrLn print bbs

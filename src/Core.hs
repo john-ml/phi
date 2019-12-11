@@ -9,6 +9,7 @@ import Data.Semigroup
 import qualified Data.Foldable as F
 import Data.Bifunctor
 import Data.Functor
+import Data.Maybe
 -- import Data.Functor.Foldable
 -- import Data.Functor.Foldable.TH
 -- import Data.Functor.Classes
@@ -37,7 +38,7 @@ import qualified Text.Megaparsec.Char.Lexer as L
 
 import Util
 
-import Data.HList.CommonMain
+import Data.HList.CommonMain hiding (Any)
 import Control.Lens
 
 #define THEUSUAL Eq, Ord, Show, Functor, Foldable, Traversable
@@ -177,7 +178,7 @@ data FnCall a = FnCall
 type CallGraph a = Map Var (Set (FnCall a))
 
 -- ...and determine whether each function should be an SSA block or a CFG.
-type BBMap = Map Var Bool
+type BBs = Set Var
 
 -- -------------------- Doc formatting utils --------------------
 
@@ -630,6 +631,7 @@ aAnno = \case
   APrim a _ _ _ _ _  -> a
   ACoerce a _ _ _ _ -> a
   ACall a _ _ _ _ _ -> a
+  ATail a _ _ _ _ -> a
   ACase a _ _ -> a
   ARec a _ _ _ -> a
   ATuple a _ _ _ _ -> a
@@ -677,7 +679,7 @@ annoFV = go where
     ACase a (goAtom -> x) (map (fmap (fmap go)) -> pes) ->
       ACase (set (atomFVs x ∪ foldMap (fvs . snd . snd) pes) a) x pes
     ARec a (goAFuncs -> fs) l (go -> e) ->
-      ARec (set (foldMap afuncFVs fs ∪ (fvs e S.\\ names fs)) a) fs l e
+      ARec (set ((foldMap afuncFVs fs ∪ fvs e) S.\\ names fs) a) fs l e
 
 -- -------------------- Call graph construction --------------------
 
@@ -705,23 +707,51 @@ graphOf = go Nothing where
 
 -- -------------------- Toposort vars --------------------
 
-data Component = Sing Var | SCC [Var] deriving (Eq, Ord, Show)
+type FVar = (Var, Set Var) -- Store fn name + free variables it closes over
+data Component = Sing FVar | SCC [FVar] deriving (Eq, Ord, Show)
 
-sortedVars :: ANF a -> [Component]
-sortedVars = D.toList . go where
-  go :: ANF a -> DList Component
+sortedFVars :: ANF FVAnn -> [Component]
+sortedFVars = D.toList . go where
+  go :: ANF FVAnn -> DList Component
   go = \case
     AHalt _ -> D.fromList []
-    APrim _ x _ _ _ e -> Sing x `D.cons` go e
-    ACoerce _ x _ _ e -> Sing x `D.cons` go e
-    ACall _ x _ _ _ e -> Sing x `D.cons` go e
-    ATail _ x _ _ _ -> D.fromList [Sing x]
-    ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> Sing x `D.cons` go e) xpes
-    ARec _ fs l e -> D.cons (SCC (bundleNames fs)) (foldMap goAFunc fs <> D.cons (Sing l) (go e))
-  goAFunc (AFunc _ _ axts _ e) = D.fromList (map (\ (_, x, _) -> Sing x) axts) <> go e
+    APrim a x _ _ _ e -> go e
+    ACoerce a x _ _ e -> go e
+    ACall a x _ _ _ e -> go e
+    ATail a x _ _ _ -> D.fromList []
+    ACase _ _ xpes -> foldMap (\ (_, (_, e)) -> go e) xpes
+    ARec _ fs _ e -> D.cons (SCC (map goF fs)) (foldMap goAFunc fs <> go e) where
+      goF (AFunc a f _ _ _) = (f, a^.fvSet)
+      goAFunc (AFunc _ _ _ _ e) = go e
 
 -- -- ...and determine whether each function should be an SSA block or a CFG.
--- type BBMap = Map Var Bool
+
+mapBBs :: CallGraph FVAnn -> [Component] -> BBs
+mapBBs graph vars = go vars `execState` S.empty where
+  flow :: Var -> State BBs Bool
+  flow caller = (caller ∉) <$> get <* modify' (S.insert caller)
+  goVar :: Var -> State BBs Bool
+  goVar x = do
+    bbs <- get
+    if x ∉ bbs then
+      return False
+    else case graph M.!? x of
+      Just (catMaybes . map callerOf . S.toList -> callers) -> or <$> mapM flow callers
+      Nothing -> return False
+  goFVar :: FVar -> State BBs Bool
+  goFVar (x, fv) = do
+    when (not (S.null fv)) $ modify' (S.insert x)
+    goVar x
+  goSCC :: [FVar] -> State BBs ()
+  goSCC xs = do
+    p <- or <$> mapM goFVar xs
+    when p (void $ goSCC xs)
+  goComp :: Component -> State BBs ()
+  goComp = \case
+    Sing x -> void $ goFVar x
+    SCC xs -> goSCC xs
+  go :: [Component] -> State BBs ()
+  go = mapM_ goComp
 
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 
