@@ -150,7 +150,7 @@ type ParseFields = '[Tagged "loc" P.SourcePos]
 type ParseAnn = Record ParseFields
 
 -- After parsing, make bindings unique
-data HasUB = HasUB deriving Show
+data HasUB = HasUB deriving (Eq, Ord, Show)
 type UBFields = Tagged "hasUB" HasUB : ParseFields
 type UBAnn = Record UBFields
 
@@ -170,8 +170,9 @@ type FVAnn = Record FVFields
 -- ...compute the call graph...
 data FnCall a = FnCall
   { isTail :: Bool
-  , callerOf :: Var
+  , callerOf :: Maybe Var -- Nothing ==> main
   , actualsOf :: [Atom a]
+  , locOf :: P.SourcePos
   } deriving (THEUSUAL)
 type CallGraph a = Map Var (Set (FnCall a))
 
@@ -528,8 +529,9 @@ data ANF a
   | ACoerce a Var Ty (Atom a) (ANF a)
   -- Control flow / name binding
   | ACall a Var Ty (Atom a) [Atom a] (ANF a)
-  | ACase a (Atom a) [(Maybe Integer, ANF a)]
-  | ARec a [AFunc a] (ANF a) -- Function bundle
+  | ATail a Var Ty (Atom a) [Atom a]
+  | ACase a (Atom a) [(Var, (Maybe Integer, ANF a))]
+  | ARec a [AFunc a] Var (ANF a) -- Function bundle
   -- Aggregates
   | ATuple a Var Ty [Atom a] (ANF a)
   | AVector a Var Ty [Atom a] (ANF a)
@@ -539,12 +541,12 @@ data ANF a
   | AUpdate a Var Ty (Atom a) (APath a) (ANF a) -- e with path = e (insertvalue, insertelement)
   deriving (THEUSUAL)
 
+-- Get names from a function bundle
+bundleNames :: [AFunc a] -> [Var]
+bundleNames = map (\ (AFunc _ f _ _ _) -> f)
+
 toANF :: Exp TyAnn -> ANF TyAnn
 toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt x) where
-  gen' = modify' (first succ) >> fst <$> get
-  push f = modify' (second (. f))
-  put' = modify' . second . const
-  get' = snd <$> get
   go :: Map Var (Atom TyAnn) -> Exp TyAnn -> State (Var, ANF TyAnn -> ANF TyAnn) (Atom TyAnn)
   go σ = \case
     Var a x -> return $ σ ! (a, x)
@@ -571,23 +573,49 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       return $ AVar a x
     Case a e pes -> do
       e' <- go σ e
-      k <- get' <* put' id
+      k <- get'
       pes' <- forM pes $ \ (p :=> e1) -> do
+        put' id
         e1' <- go σ e1
         k <- get'
-        return (p, k (AHalt e1'))
+        l <- gen'
+        return (l, (p, k (AHalt e1')))
       put' $ const (k (ACase a e' pes'))
       return $ error "Tried to inspect return value of Case"
     Rec a helpers e -> do
-      k <- get' <* put' id
+      k <- get'
       helpers' <- forM helpers $ \ (Func a f axts t e1) -> do
+        put' id
         e1' <- go σ e1
         k <- get'
         return (AFunc a f axts t (k (AHalt e1')))
-      put' $ k . ARec a helpers'
+      l <- gen'
+      put' $ k . ARec a helpers' l
       go σ e
     where
       σ ! (a, x) = M.findWithDefault (AVar a x) x σ
+      gen' = modify' (first succ) >> fst <$> get
+      push f = modify' (second (. f))
+      put' = modify' . second . const
+      get' = snd <$> get
+
+-- -------------------- Put tail calls into ATail --------------------
+
+toTails :: ANF a -> ANF a
+toTails = go where
+  go exp = case exp of
+    AHalt _ -> exp
+    APrim a x t p xs e -> APrim a x t p xs (go e)
+    ACoerce a x t y e -> ACoerce a x t y (go e)
+    ACall a x t f xs e
+      | checkTail x e -> ATail a x t f xs
+      | otherwise -> ACall a x t f xs (go e)
+    ACase a x xpes -> ACase a x (map (fmap (fmap go)) xpes)
+    ARec a fs l e -> ARec a (map goAFunc fs) l (go e)
+  goAFunc (AFunc a f axts t e) = AFunc a f axts t (go e)
+  checkTail x = \case
+    AHalt (AVar _ x') | x == x' -> True
+    _ -> False
 
 -- -------------------- FV Annotation --------------------
 
@@ -603,7 +631,7 @@ aAnno = \case
   ACoerce a _ _ _ _ -> a
   ACall a _ _ _ _ _ -> a
   ACase a _ _ -> a
-  ARec a _ _ -> a
+  ARec a _ _ _ -> a
   ATuple a _ _ _ _ -> a
   AVector a _ _ _ _ -> a
   AGep a _ _ _ _ _ -> a
@@ -626,9 +654,11 @@ afuncFVs f = afuncAnno f ^. fvSet
 annoFV :: ANF TyAnn -> ANF FVAnn
 annoFV = go where
   set s a = fvSet .==. s .*. a
+  names = S.fromList . bundleNames
+  goAtom :: Atom TyAnn -> Atom FVAnn
   goAtom = \case
     AVar a x -> AVar (set (S.singleton x) a) x
-  names = S.fromList . map (\ (AFunc _ f _ _ _) -> f)
+    AInt a i w -> AInt (set S.empty a) i w
   goAFuncs fs = map goAFunc fs where
     funcs = names fs
     goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
@@ -642,12 +672,56 @@ annoFV = go where
       ACoerce (set (S.delete x (fvs e) ∪ atomFVs y) a) x t y e
     ACall a x t (goAtom -> f) (map goAtom -> xs) (go -> e) ->
       ACall (set (S.delete x (fvs e) ∪ atomFVs f ∪ foldMap atomFVs xs) a) x t f xs e
-    ACase a (goAtom -> x) (map (fmap go) -> pes) ->
-      ACase (set (atomFVs x ∪ foldMap (fvs . snd) pes) a) x pes
-    ARec a (goAFuncs -> fs) (go -> e) ->
-      ARec (set (foldMap afuncFVs fs ∪ (fvs e S.\\ names fs)) a) fs e
+    ATail a x t (goAtom -> f) (map goAtom -> xs) ->
+      ATail (set (atomFVs f ∪ foldMap atomFVs xs) a) x t f xs
+    ACase a (goAtom -> x) (map (fmap (fmap go)) -> pes) ->
+      ACase (set (atomFVs x ∪ foldMap (fvs . snd . snd) pes) a) x pes
+    ARec a (goAFuncs -> fs) l (go -> e) ->
+      ARec (set (foldMap afuncFVs fs ∪ (fvs e S.\\ names fs)) a) fs l e
 
 -- -------------------- Call graph construction --------------------
+
+graphOf :: ANF FVAnn -> CallGraph FVAnn
+graphOf = go Nothing where
+  union = M.unionWith (∪)
+  gather = foldr union M.empty
+  add f fnCall = M.alter add' f where
+    add' = \case
+      Just calls -> Just $ S.insert fnCall calls
+      Nothing -> Just $ S.singleton fnCall
+  goAFunc (AFunc _ f _ _ e) = go (Just f) e
+  goAFuncs = foldr (union . goAFunc) M.empty
+  go callerOf = \case
+    AHalt _ -> M.empty
+    APrim _ _ _ _ _ e -> go' e
+    ACoerce _ _ _ _ e -> go' e
+    ACall ((^. loc) -> locOf) x _ (AVar _ f) actualsOf e ->
+      add f (FnCall {locOf, isTail = False, callerOf, actualsOf}) (go' e)
+    ATail ((^. loc) -> locOf) x _ (AVar _ f) actualsOf ->
+      M.singleton f . S.singleton $ FnCall {locOf, isTail = True, callerOf, actualsOf}
+    ACase _ _ pes -> foldr (\ (x, (_, e)) r -> go (Just x) e `union` r) M.empty pes
+    ARec _ fs l e -> goAFuncs fs `union` go (Just l) e
+    where go' = go callerOf
+
+-- -------------------- Toposort vars --------------------
+
+data Component = Sing Var | SCC [Var] deriving (Eq, Ord, Show)
+
+sortedVars :: ANF a -> [Component]
+sortedVars = D.toList . go where
+  go :: ANF a -> DList Component
+  go = \case
+    AHalt _ -> D.fromList []
+    APrim _ x _ _ _ e -> Sing x `D.cons` go e
+    ACoerce _ x _ _ e -> Sing x `D.cons` go e
+    ACall _ x _ _ _ e -> Sing x `D.cons` go e
+    ATail _ x _ _ _ -> D.fromList [Sing x]
+    ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> Sing x `D.cons` go e) xpes
+    ARec _ fs l e -> D.cons (SCC (bundleNames fs)) (foldMap goAFunc fs <> D.cons (Sing l) (go e))
+  goAFunc (AFunc _ _ axts _ e) = D.fromList (map (\ (_, x, _) -> Sing x) axts) <> go e
+
+-- -- ...and determine whether each function should be an SSA block or a CFG.
+-- type BBMap = Map Var Bool
 
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 
