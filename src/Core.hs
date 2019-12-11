@@ -126,6 +126,8 @@ data Exp a
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
+makeLabelable "loc hasUB typ fvSet"
+
 -- Every expression node has an annotation
 anno :: Exp a -> a
 anno = \case
@@ -139,27 +141,42 @@ anno = \case
   Case a _ _ -> a
   Rec a _ _ -> a
 
-makeLabelable "loc hasUB typ"
+raise a e = throwError (a ^. loc, e)
+
+-- -------------------- Structure of the compiler --------------------
 
 -- Parsing ==> ASTs are labelled with source locations
 type ParseFields = '[Tagged "loc" P.SourcePos]
+type ParseAnn = Record ParseFields
 
 -- After parsing, make bindings unique
 data HasUB = HasUB deriving Show
 type UBFields = Tagged "hasUB" HasUB : ParseFields
+type UBAnn = Record UBFields
 
 -- After UB, type check and annotate nodes with their types
 type TyFields = Tagged "typ" Ty : UBFields
-
-type ParseAnn = Record ParseFields
-type UBAnn = Record UBFields
 type TyAnn = Record TyFields
 
-raise a e = throwError (a ^. loc, e)
+-- Once lebelled, every expression node has a type
+typeof :: Exp TyAnn -> Ty
+typeof e = anno e ^. typ
 
--- After TC, convert to ANF and determine callers+actuals of every known function
-type Callers = Map Var (Exp TyAnn, [Exp TyAnn])
-type CallFields = Tagged "callers" Callers : TyFields
+-- After TC, convert to ANF.
+-- After ANF, label nodes with FV sets...
+type FVFields = Tagged "fvSet" (Set Var) : TyFields
+type FVAnn = Record FVFields
+
+-- ...compute the call graph...
+data FnCall a = FnCall
+  { isTail :: Bool
+  , callerOf :: Var
+  , actualsOf :: [Atom a]
+  } deriving (THEUSUAL)
+type CallGraph a = Map Var (Set (FnCall a))
+
+-- ...and determine whether each function should be an SSA block or a CFG.
+type BBMap = Map Var Bool
 
 -- -------------------- Doc formatting utils --------------------
 
@@ -373,40 +390,25 @@ instance PP TCErr where
 
 type TC =
   ExceptT (P.SourcePos, TCErr)
-  (Reader
-    ( Map Var (Ty, Bool) -- x ↦ (typeof x, x must basic block)
-    , Bool -- Whether or not we are in tail position
-    ))
+  (Reader (Map Var Ty)) -- Typing environmnt
 
-runTC' :: TC a -> Map Var (Ty, Bool) -> Bool -> Either (P.SourcePos, TCErr) a
-runTC' m r b = runExceptT m `runReader` (r, b)
+runTC' :: TC a -> Map Var Ty -> Either (P.SourcePos, TCErr) a
+runTC' m r = runExceptT m `runReader` r
 
 runTC :: TC a -> Either String a
-runTC m = first pretty $ runTC' m M.empty True where
+runTC m = first pretty $ runTC' m M.empty where
   pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err) M.empty
 
-untail :: TC a -> TC a
-untail = local (\ (env, _) -> (env, False))
+withBindings :: [Var] -> [Ty] -> TC a -> TC a
+withBindings xs ts = local (M.union . M.fromList $ zip xs ts)
 
-withBindings :: [Var] -> [Ty] -> [Bool] -> TC a -> TC a
-withBindings xs ts bs = local (\ (m, b) -> (M.fromList (zip xs (zip ts bs)) `M.union` m, b))
-
-withBinding :: Var -> Ty -> Bool -> TC a -> TC a
-withBinding x t b = local (first $ M.insert x (t, b))
-
-isTail :: TC Bool
-isTail = snd <$> ask
-
-find :: UBAnn -> Var -> TC (Ty, Bool)
-find a x = (M.!? x) . fst <$> ask >>= \case
-  Just r -> return r
-  Nothing -> raise a $ NotInScope x
+withBinding :: Var -> Ty -> TC a -> TC a
+withBinding x t = local (M.insert x t)
 
 tcLookup :: UBAnn -> Var -> TC Ty
-tcLookup a x = fst <$> find a x
-
-isBB :: UBAnn -> Var -> TC Bool
-isBB a x = snd <$> find a x
+tcLookup a x = (M.!? x) <$> ask >>= \case
+  Just r -> return r
+  Nothing -> raise a $ NotInScope x
 
 check :: Exp UBAnn -> Ty -> TC (Exp TyAnn)
 check exp ty = case exp of
@@ -461,7 +463,7 @@ infer = \case
     return (ty, Coerce (typ .==. ty .*. a) e' ty)
   Let a x t e1 e -> do
     e1' <- check e1 t
-    (ty, e') <- withBinding x t False (infer e)
+    (ty, e') <- withBinding x t (infer e)
     return (ty, Let (typ .==. ty .*. a) x t e1' e')
   Call a e es -> infer e >>= \case
     (FPtr ts t, e') -> do
@@ -471,14 +473,13 @@ infer = \case
   Rec a funcs e -> do
     let fs = map (\ (Func _ f _ _ _) -> f) funcs
     let ts = map (\ (Func _ _ axts t _) -> FPtr (map (\ (_, _, t) -> t) axts) t) funcs
-    let bbs = fs $> False -- TODO
-    withBindings fs ts bbs $ do
+    withBindings fs ts $ do
       funcs' <- forM funcs $ \ (Func a f axts t e) -> do
         let xs = map (\ (_, x, _) -> x) axts
         let ts = map (\ (_, _, t) -> t) axts
         let axts' = map (\ (a, x, t) -> (typ .==. Void .*. a, x, t)) axts
         current <- ask
-        e' <- withBindings xs ts (ts $> False) (check e t)
+        e' <- withBindings xs ts (check e t)
         return $ Func (typ .==. Void .*. a) f axts' t e'
       (ty, e') <- infer e
       return (ty, Rec (typ .==. ty .*. a) funcs' e')
@@ -505,7 +506,7 @@ infer = \case
 --       return $ AStore (ty, a) d' s' e'
 --     AnnoTy ty -> raise a $ ExGotShape "pointer" ty
 
--- -------------------- Let binding every intermediate value --------------------
+-- -------------------- Conversion to ANF --------------------
 
 data Atom a
   = AVar a Var
@@ -585,14 +586,68 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
         return (AFunc a f axts t (k (AHalt e1')))
       put' $ k . ARec a helpers'
       go σ e
-    -- Tuple a es -> Tuple (goAnn a) <$> mapM go es
-    -- Vector a es -> Vector (goAnn a) <$> mapM go es
     where
       σ ! (a, x) = M.findWithDefault (AVar a x) x σ
 
--- Once lebelled, every expression node has a type
-typeof :: Exp TyAnn -> Ty
-typeof e = anno e ^. typ
+-- -------------------- FV Annotation --------------------
+
+atomAnno :: Atom a -> a
+atomAnno = \case
+  AVar a _ -> a
+  AInt a _ _ -> a
+
+aAnno :: ANF a -> a
+aAnno = \case
+  AHalt x -> atomAnno x
+  APrim a _ _ _ _ _  -> a
+  ACoerce a _ _ _ _ -> a
+  ACall a _ _ _ _ _ -> a
+  ACase a _ _ -> a
+  ARec a _ _ -> a
+  ATuple a _ _ _ _ -> a
+  AVector a _ _ _ _ -> a
+  AGep a _ _ _ _ _ -> a
+  ALoad a _ _ _ _ _ -> a
+  AStore a _ _ _ _ -> a
+  AUpdate a _ _ _ _ _  -> a
+
+fvs :: ANF FVAnn -> Set Var
+fvs e = aAnno e ^. fvSet
+
+atomFVs :: Atom FVAnn -> Set Var
+atomFVs x = atomAnno x ^. fvSet
+
+afuncAnno :: AFunc a -> a
+afuncAnno (AFunc a _ _ _ _) = a
+
+afuncFVs :: AFunc FVAnn -> Set Var
+afuncFVs f = afuncAnno f ^. fvSet
+
+annoFV :: ANF TyAnn -> ANF FVAnn
+annoFV = go where
+  set s a = fvSet .==. s .*. a
+  goAtom = \case
+    AVar a x -> AVar (set (S.singleton x) a) x
+  names = S.fromList . map (\ (AFunc _ f _ _ _) -> f)
+  goAFuncs fs = map goAFunc fs where
+    funcs = names fs
+    goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
+      AFunc (set (fvs e S.\\ S.fromList (map (\ (_, x, _) -> x) axts) S.\\ funcs) a) f axts t e
+  go :: ANF TyAnn -> ANF FVAnn
+  go = \case
+    AHalt x -> AHalt (goAtom x)
+    APrim a x t p (map goAtom -> xs) (go -> e) ->
+      APrim (set (S.delete x (fvs e) ∪ foldMap atomFVs xs) a) x t p xs e
+    ACoerce a x t (goAtom -> y) (go -> e) ->
+      ACoerce (set (S.delete x (fvs e) ∪ atomFVs y) a) x t y e
+    ACall a x t (goAtom -> f) (map goAtom -> xs) (go -> e) ->
+      ACall (set (S.delete x (fvs e) ∪ atomFVs f ∪ foldMap atomFVs xs) a) x t f xs e
+    ACase a (goAtom -> x) (map (fmap go) -> pes) ->
+      ACase (set (atomFVs x ∪ foldMap (fvs . snd) pes) a) x pes
+    ARec a (goAFuncs -> fs) (go -> e) ->
+      ARec (set (foldMap afuncFVs fs ∪ (fvs e S.\\ names fs)) a) fs e
+
+-- -------------------- Call graph construction --------------------
 
 -- -- -- -------------------- Code generation utils --------------------
 -- -- 
