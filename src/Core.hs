@@ -636,20 +636,24 @@ opG = \case
   AVar _ x -> varG x
   AInt _ i _ -> show'' i
 
+-- Instructions are always indented exactly once
+inst :: Doc -> Doc
+inst = indent . line' 
+
 expG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> GenM Doc
 expG graph bbs = go where
-  x .= doc = line' $ varG x <> " = " <> doc
+  x .= doc = inst $ varG x <> " = " <> doc
   (<:) :: Var -> Doc -> Doc
   lbl <: body = F.fold
     [ line' $ "x" <> show'' lbl <> ":"
-    , indent body
+    , body
     ]
   ret e line = (line <>) <$> go e
   tup xs = "(" <> commaSep (map atomG xs) <> ")"
   ops = commaSep . map opG
   go :: ANF FVAnn -> GenM Doc
   go = \case
-    AHalt x -> return . line' $ "ret " <> atomG x
+    AHalt x -> return . inst $ "ret " <> atomG x
     APrim a x t p xs e -> ret e $ x .= (pp p <> " " <> pp t <> " " <> ops xs)
     ACoerce a x t y e ->
       case (t, atomAnno y ^. typ) of
@@ -659,14 +663,14 @@ expG graph bbs = go where
     ACall a x t (AVar _ f) xs e ->
       ret e $ x .= ("call " <> pp t <> " " <> gvarG f <> tup xs)
     ATail a x t (AVar _ f) xs
-      | f ∈ bbs -> return . line' $ "br label " <> varG f
+      | f ∈ bbs -> return . inst $ "br label " <> varG f
       | otherwise -> return $ F.fold
-          [ line' $ x .= ("tail call " <> pp t <> " " <> gvarG f <> tup xs)
-          , line' $ "ret " <> pp t <> " " <> varG x
+          [ x .= ("tail call " <> pp t <> " " <> gvarG f <> tup xs)
+          , inst $ "ret " <> pp t <> " " <> varG x
           ]
     ACase a x lpes -> do
       case [r | r@(_, (_, (Nothing, _))) <- zip [0..] lpes] of
-        [] -> do l <- gen; genSwitch (length lpes) ("fallback" <> show'' l) (line "unreachable")
+        [] -> do l <- gen; genSwitch (length lpes) ("fallback" <> show'' l) (inst "unreachable")
         (i, (l, (_, e))) : _ -> genSwitch i ("x" <> show'' l) =<< go e
       where
         genSwitch i defaultLabel defaultBody = do
@@ -676,19 +680,19 @@ expG graph bbs = go where
             e' <- go e
             return (l <: e')
           return $ F.fold
-            [ line' $ "switch " <> atomG x <> ", label %" <> defaultLabel <> " ["
-            , indent . F.fold . for lpes' $ \ (l, (Just p, e)) ->
-                line' $ pp ty <> " " <> show'' p <> ", label " <> varG l
-            , line' "]"
+            [ inst $ "switch " <> atomG x <> ", label %" <> defaultLabel <> " ["
+            , F.fold . for lpes' $ \ (l, (Just p, e)) ->
+                indent . indent . line' $ pp ty <> " " <> show'' p <> ", label " <> varG l
+            , indent $ line' "]"
             , F.fold arms
             , line' $ defaultLabel <> ":"
-            , indent defaultBody
+            , defaultBody
             ]
     ARec a fs l e -> do
       fs' <- mapM goAFunc fs
       e' <- go e
       return $ F.fold
-        [ line' $ "br label " <> varG l
+        [ inst $ "br label " <> varG l
         , F.fold fs'
         , l <: e'
         ]
@@ -711,7 +715,7 @@ expG graph bbs = go where
               Nothing -> "[" <> opG val <> ", " <> mainLabel <> "]"
         e' <- go e
         return . (f <:) $ F.fold
-          [ F.fold . map line' $ zipWith mkPhi xts actualss'
+          [ F.fold $ zipWith mkPhi xts actualss'
           , e'
           ]
     | otherwise = do
