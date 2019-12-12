@@ -103,18 +103,19 @@ data Exp a
   deriving (THEUSUAL)
 
 -- Since this is LLVM and not λ-calculus, every function must satisfy some conditions
--- so that they can be implemented as SSA blocks using φ-nodes instead of closures.
+-- so that they can be implemented as basic blocks using φ-nodes instead of closures.
 -- - All functions f where some variables are live upon entry to f (i.e., f itself
---   closes over those variables or calls functions which do) must become SSA blocks.
+--   closes over those variables or calls functions which do) must become basic blocks.
 -- - Specifically, x is live at f if, assuming UB,
 --   (1) x ∈ FV(body of f) or
 --   (2) f calls g, x is live at g, and x ∉ BV(body of f).
 -- - All calls to SSA-block functions must be in tail position.
 -- - These tail calls will become `br` instructions and the corresponding functions
---   will become SSA blocks with φ-nodes.
--- - Functions which don't need variables become global functions.
---   Technically, these functions can also become SSA blocks if only called in tail
---   position, but that probably doesn't buy much.
+--   will become basic blocks with φ-nodes.
+-- - If a function has no live variables upon entry, it can become a global function.
+--   However, if the function is only ever called in tail position, it could become
+--   a basic block instead. This is beneficial as tail calls have to adhere to calling
+--   conventions while `br` instructions + φ-nodes don't.
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
@@ -302,6 +303,7 @@ checkNumOp a = \case
       PTy Float -> True
       PTy Double -> True
       PTy FP128 -> True
+      _ -> False
 
 checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
 checkPrim a es = \case
@@ -615,7 +617,8 @@ checkBBs graph bbs = forM_ bbs $ \ x ->
 
 type GenM =
   WriterT Doc -- Accumulate global defns
-  (State Var) -- Fresh label names
+  (ReaderT (Set Var) -- Known functions
+  (State Var)) -- Fresh label names
 
 mainLabel :: Doc = "%start"
 
@@ -625,52 +628,61 @@ varG x = "%x" <> show'' x
 gvarG :: Var -> Doc
 gvarG x = "@f" <> show'' x
 
-atomG :: Atom FVAnn -> Doc
-atomG = \case
-  AVar a x -> pp (a^.typ) <> " " <> varG x
-  AInt _ i w -> "i" <> show'' w <> " " <> show'' i
-
--- Like atom, but omits the type annotation
-opG :: Atom FVAnn -> Doc
-opG = \case
-  AVar _ x -> varG x
-  AInt _ i _ -> show'' i
-
 -- Instructions are always indented exactly once
 inst :: Doc -> Doc
 inst = indent . line' 
 
 expG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> GenM Doc
 expG graph bbs = go where
-  x .= doc = inst $ varG x <> " = " <> doc
+  varG' :: Var -> GenM Doc
+  varG' x = do known <- ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
+  atomG = \case
+    AVar a x -> do x' <- varG' x; return $ pp (a^.typ) <> " " <> x'
+    AInt _ i w -> return $ "i" <> show'' w <> " " <> show'' i
+  -- Like atomG, but omits the type annotation
+  opG = \case
+    AVar _ x -> varG' x
+    AInt _ i _ -> return $ show'' i
+  x .= doc = do x' <- varG' x; return . inst $ x' <> " = " <> doc
   (<:) :: Var -> Doc -> Doc
   lbl <: body = F.fold
     [ line' $ "x" <> show'' lbl <> ":"
     , body
     ]
   ret e line = (line <>) <$> go e
-  tup xs = "(" <> commaSep (map atomG xs) <> ")"
-  ops = commaSep . map opG
+  tup xs = do xs' <- mapM atomG xs; return $ "(" <> commaSep xs' <> ")"
+  ops = fmap commaSep . mapM opG
   go :: ANF FVAnn -> GenM Doc
   go = \case
-    AHalt x -> return . inst $ "ret " <> atomG x
-    APrim a x t p xs e -> ret e $ x .= (pp p <> " " <> pp t <> " " <> ops xs)
+    AHalt x -> inst . ("ret " <>) <$> atomG x
+    APrim a x t p xs e -> do
+      xs' <- ops xs
+      ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
     ACoerce a x t y e ->
       case (t, atomAnno y ^. typ) of
-        (t2@(PTy (Ptr _)), t1@(PTy (Ptr _))) ->
-          ret e $ x .= "bitcast " <> atomG y <> " to " <> pp t2
+        (t2@(PTy (Ptr _)), t1@(PTy (Ptr _))) -> do
+          y' <- atomG y
+          ret e =<< x .= ("bitcast " <> y' <> " to " <> pp t2)
         (t2, t1) -> error $ "Unsupported coercion from " ++ show t1 ++ " to " ++ show t2
-    ACall a x t (AVar _ f) xs e ->
-      ret e $ x .= ("call " <> pp t <> " " <> gvarG f <> tup xs)
+    ACall a x t (AVar _ f) xs e -> do
+      known <- ask
+      let f' = if f ∉ bbs && f ∈ known then gvarG f else varG f
+      xs' <- tup xs
+      ret e =<< x .= ("call " <> pp t <> " " <> f' <> xs')
     ATail a x t (AVar _ f) xs
       | f ∈ bbs -> return . inst $ "br label " <> varG f
-      | otherwise -> return $ F.fold
-          [ x .= ("tail call " <> pp t <> " " <> gvarG f <> tup xs)
-          , inst $ "ret " <> pp t <> " " <> varG x
-          ]
+      | otherwise -> do
+          xs' <- tup xs
+          f' <- varG' f
+          F.fold <$> sequence
+            [ x .= ("tail call " <> pp t <> " " <> f' <> xs')
+            , return . inst $ "ret " <> pp t <> " " <> varG x
+            ]
     ACase a x lpes -> do
       case [r | r@(_, (_, (Nothing, _))) <- zip [0..] lpes] of
-        [] -> do l <- gen; genSwitch (length lpes) ("fallback" <> show'' l) (inst "unreachable")
+        [] -> do
+          l <- gen
+          genSwitch (length lpes) ("fallback" <> show'' l) (inst "unreachable")
         (i, (l, (_, e))) : _ -> genSwitch i ("x" <> show'' l) =<< go e
       where
         genSwitch i defaultLabel defaultBody = do
@@ -679,8 +691,9 @@ expG graph bbs = go where
           arms :: [Doc] <- forM lpes' $ \ (l, (_, e)) -> do
             e' <- go e
             return (l <: e')
+          x' <- atomG x
           return $ F.fold
-            [ inst $ "switch " <> atomG x <> ", label %" <> defaultLabel <> " ["
+            [ inst $ "switch " <> x' <> ", label %" <> defaultLabel <> " ["
             , F.fold . for lpes' $ \ (l, (Just p, e)) ->
                 indent . indent . line' $ pp ty <> " " <> show'' p <> ", label " <> varG l
             , indent $ line' "]"
@@ -689,8 +702,8 @@ expG graph bbs = go where
             , defaultBody
             ]
     ARec a fs l e -> do
-      fs' <- mapM goAFunc fs
-      e' <- go e
+      let s = S.fromList (bundleNames fs)
+      (fs', e') <- local (s ∪) $ (,) <$> mapM goAFunc fs <*> go e
       return $ F.fold
         [ inst $ "br label " <> varG l
         , F.fold fs'
@@ -708,16 +721,17 @@ expG graph bbs = go where
           actualss' :: [[(Maybe Var, Atom FVAnn)]] =
             L.transpose (zipWith (\ caller actuals -> (caller,) <$> actuals) callers actualss)
           xts :: [(Var, Ty)] = map (\ (_, x, t) -> (x, t)) axts
-          mkPhi (x, t) actuals = x .= ("phi " <> pp t <> " " <> commaSep (map mkActual actuals))
-          mkActual (caller, val) =
-            case caller of
-              Just l -> "[" <> opG val <> ", " <> varG l <> "]"
-              Nothing -> "[" <> opG val <> ", " <> mainLabel <> "]"
+          mkPhi (x, t) actuals = do
+            actuals' <- mapM mkActual actuals
+            x .= ("phi " <> pp t <> " " <> commaSep actuals')
+          mkActual (caller, val) = do
+            val' <- opG val
+            return $ case caller of
+              Just l -> "[" <> val' <> ", " <> varG l <> "]" :: Doc
+              Nothing -> "[" <> val' <> ", " <> mainLabel <> "]"
         e' <- go e
-        return . (f <:) $ F.fold
-          [ F.fold $ zipWith mkPhi xts actualss'
-          , e'
-          ]
+        phis <- zipWithM mkPhi xts actualss'
+        return $ f <: (F.fold phis <> e')
     | otherwise = do
         e' <- go e
         tell $ F.fold
@@ -730,7 +744,7 @@ expG graph bbs = go where
 
 mainG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> Doc
 mainG graph bbs e =
-  let (body, globals) = runWriterT (expG graph bbs e) `evalState` 0 in
+  let (body, globals) = runWriterT (expG graph bbs e) `runReaderT` S.empty `evalState` 0 in
   globals <> F.fold
     [ line' $ "define i32 @main() {"
     , body
@@ -790,7 +804,7 @@ instance PP Ty where
     Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
     Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
     Tup ts -> "{" <> commaSep (map pp ts) <> "}"
-    FPtr ts t -> "(fun (" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
+    FPtr ts t -> pp t <> "(" <> commaSep (map pp ts) <> ")*"
 
 instance PP (Func a) where
   pp (Func _ f xts t e) =

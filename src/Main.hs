@@ -101,3 +101,8 @@ main = do
        , "0i32"
        ]
   either putStrLn putStrLn $ compile fib
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(g: fun (i32, i32) -> i32, x: i32): i32 = g(x, x) in"
+    , "rec k(n: i32, m: i32): i32 = add(mul(n, n), mul(m, m)) in"
+    , "f(k, 3i32)"
+    ]
