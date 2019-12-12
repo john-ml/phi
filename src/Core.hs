@@ -963,23 +963,5 @@ compile s = do
   first show $ checkBBs graph bbs
   return . runDoc $ mainG graph bbs anf
 
--- compileFile :: FilePath -> IO (Either String String)
--- compileFile f = parseFile f >>= \case
---   Left err -> return $ Left err
---   Right p -> Right <$> codeGen p
-
--- -- -------------------- Full compilation --------------------
--- 
--- compile :: String -> FilePath -> FilePath -> IO ()
--- compile s cOut binOut = transpile s >>= \case
---   Left err -> putStrLn err
---   Right c -> do
---     writeFile cOut c
---     let flags = ["-O2", "-g", "-I", "runtime", "runtime/gt_switch.s", cOut, "-o", binOut]
---     P.createProcess (P.proc "gcc" flags)
---     return ()
--- 
--- compileFile :: FilePath -> FilePath -> FilePath -> IO ()
--- compileFile piIn cOut binOut = do
---   s <- readFile piIn
---   compile s cOut binOut
+compileFile :: FilePath -> IO (Either String String)
+compileFile f = compile <$> readFile f
