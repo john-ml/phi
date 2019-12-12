@@ -171,75 +171,6 @@ type CallGraph a = Map Var (Set (FnCall a))
 -- ...and determine whether each function should be an SSA block or a CFG.
 type BBs = Set Var
 
--- -------------------- Doc formatting utils/pretty printers --------------------
-
-type Str = DList Char -- For efficient catenation
-
--- Indentation as input
-type Doc = Reader Str Str
-deriving instance Semigroup a => Semigroup (Reader r a)
-deriving instance Monoid a => Monoid (Reader r a)
-
-show' :: Show a => a -> Str
-show' = D.fromList . show
-
-show'' :: Show a => a -> Doc
-show'' = pure . show'
-
-runDoc :: Doc -> String
-runDoc c = D.toList $ c `runReader` ""
-
-instance IsString Doc where fromString = pure . D.fromList
-
-indent :: Doc -> Doc
-indent = local ("  " <>)
-
-line :: Str -> Doc
-line l = reader $ \ s -> s <> l <> "\n"
-
-line' :: Doc -> Doc
-line' l = reader $ \ s -> s <> runReader l s <> "\n"
-
-calate :: Doc -> [Doc] -> Doc
-calate sep ds = F.fold (L.intersperse sep ds)
-
-commaSep :: [Doc] -> Doc
-commaSep = calate ", "
-
-class PP a where pp :: a -> Doc
-
-instance PP PTy where
-  pp = \case
-    I w -> "i" <> show'' w
-    Half -> "half"
-    Float -> "float"
-    Double -> "double"
-    FP128 -> "FP128"
-    Ptr t -> "&" <> pp t
-
-instance PP Ty where
-  pp = \case
-    Void -> "void"
-    PTy t -> pp t
-    Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
-    Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
-    Tup ts -> "{" <> commaSep (map pp ts) <> "}"
-    FPtr ts t -> "(fun (" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
-
-instance PP (Func a) where
-  pp (Func _ f xts t e) =
-    let xts' = map (\ (_, x, t) -> show'' x <> ": " <> pp t) xts in
-    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " =" <> indent (pp e)
-
-instance PP Prim where
-  pp = \case
-    Add -> "add"
-    Mul -> "mul"
-    Sub -> "sub"
-    Div -> "div"
-
-instance PP (Exp a) where pp = undefined
-
 -- -------------------- Variables --------------------
 
 -- Useful for generating fresh variable
@@ -433,6 +364,8 @@ data AStep a
   | AIndex (ANF a) -- gep offset: e[e]
   deriving (THEUSUAL)
 
+-- In addition to normal ANF-y things, case arms and continuations of Rec blocks are labelled
+-- with fresh variables (which will become the names of basic blocks in LLVM output)
 data AFunc a = AFunc a Var [(a, Var, Ty)] Ty (ANF a) deriving (THEUSUAL)
 data ANF a
   = AHalt (Atom a)
@@ -678,6 +611,197 @@ checkBBs graph bbs = forM_ bbs $ \ x ->
       when (not isTail) . throwError $ NotTail locOf
     Nothing -> return ()
 
+-- -------------------- Code generation --------------------
+
+type GenM =
+  WriterT Doc -- Accumulate global defns
+  (State Var) -- Fresh label names
+
+mainLabel :: Doc = "%start"
+
+varG :: Var -> Doc
+varG x = "%x" <> show'' x
+
+gvarG :: Var -> Doc
+gvarG x = "@f" <> show'' x
+
+atomG :: Atom FVAnn -> Doc
+atomG = \case
+  AVar a x -> pp (a^.typ) <> " " <> varG x
+  AInt _ i w -> "i" <> show'' w <> " " <> show'' i
+
+-- Like atom, but omits the type annotation
+opG :: Atom FVAnn -> Doc
+opG = \case
+  AVar _ x -> varG x
+  AInt _ i _ -> show'' i
+
+expG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> GenM Doc
+expG graph bbs = go where
+  x .= doc = line' $ varG x <> " = " <> doc
+  (<:) :: Var -> Doc -> Doc
+  lbl <: body = F.fold
+    [ line' $ "x" <> show'' lbl <> ":"
+    , indent body
+    ]
+  ret e line = (line <>) <$> go e
+  tup xs = "(" <> commaSep (map atomG xs) <> ")"
+  ops = commaSep . map opG
+  go :: ANF FVAnn -> GenM Doc
+  go = \case
+    AHalt x -> return . line' $ "ret " <> atomG x
+    APrim a x t p xs e -> ret e $ x .= (pp p <> " " <> pp t <> " " <> ops xs)
+    ACoerce a x t y e ->
+      case (t, atomAnno y ^. typ) of
+        (t2@(PTy (Ptr _)), t1@(PTy (Ptr _))) ->
+          ret e $ x .= "bitcast " <> atomG y <> " to " <> pp t2
+        (t2, t1) -> error $ "Unsupported coercion from " ++ show t1 ++ " to " ++ show t2
+    ACall a x t (AVar _ f) xs e ->
+      ret e $ x .= ("call " <> pp t <> " " <> gvarG f <> tup xs)
+    ATail a x t (AVar _ f) xs
+      | f ∈ bbs -> return . line' $ "br label " <> varG f
+      | otherwise -> return $ F.fold
+          [ line' $ x .= ("tail call " <> pp t <> " " <> gvarG f <> tup xs)
+          , line' $ "ret " <> pp t <> " " <> varG x
+          ]
+    ACase a x lpes -> do
+      case [r | r@(_, (_, (Nothing, _))) <- zip [0..] lpes] of
+        [] -> do l <- gen; genSwitch (length lpes) ("fallback" <> show'' l) (line "unreachable")
+        (i, (l, (_, e))) : _ -> genSwitch i ("x" <> show'' l) =<< go e
+      where
+        genSwitch i defaultLabel defaultBody = do
+          let ty = atomAnno x ^. typ
+          let lpes' = take i lpes
+          arms :: [Doc] <- forM lpes' $ \ (l, (_, e)) -> do
+            e' <- go e
+            return (l <: e')
+          return $ F.fold
+            [ line' $ "switch " <> atomG x <> ", label %" <> defaultLabel <> " ["
+            , indent . F.fold . for lpes' $ \ (l, (Just p, e)) ->
+                line' $ pp ty <> " " <> show'' p <> ", label " <> varG l
+            , line' "]"
+            , F.fold arms
+            , line' $ defaultLabel <> ":"
+            , indent defaultBody
+            ]
+    ARec a fs l e -> do
+      fs' <- mapM goAFunc fs
+      e' <- go e
+      return $ F.fold
+        [ line' $ "br label " <> varG l
+        , F.fold fs'
+        , l <: e'
+        ]
+  goAFunc (AFunc a f axts t e)
+    | f ∈ bbs = do
+        let
+          calls :: [FnCall FVAnn] =
+            case graph M.!? f of
+              Just x -> S.toList x
+              Nothing -> error "Incomplete call graph"
+          callers = callerOf <$> calls
+          actualss = actualsOf <$> calls
+          actualss' :: [[(Maybe Var, Atom FVAnn)]] =
+            L.transpose (zipWith (\ caller actuals -> (caller,) <$> actuals) callers actualss)
+          xts :: [(Var, Ty)] = map (\ (_, x, t) -> (x, t)) axts
+          mkPhi (x, t) actuals = x .= ("phi " <> pp t <> " " <> commaSep (map mkActual actuals))
+          mkActual (caller, val) =
+            case caller of
+              Just l -> "[" <> opG val <> ", " <> varG l <> "]"
+              Nothing -> "[" <> opG val <> ", " <> mainLabel <> "]"
+        e' <- go e
+        return . (f <:) $ F.fold
+          [ F.fold . map line' $ zipWith mkPhi xts actualss'
+          , e'
+          ]
+    | otherwise = do
+        e' <- go e
+        tell $ F.fold
+          [ let axts' = map (\ (_, x, t) -> pp t <> " " <> varG x) axts in
+            line' $ "define " <> pp t <> " " <> gvarG f <> "(" <> commaSep axts' <> ") {"
+          , e'
+          , line' "}"
+          ]
+        return mempty
+
+mainG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> Doc
+mainG graph bbs e =
+  let (body, globals) = runWriterT (expG graph bbs e) `evalState` 0 in
+  globals <> F.fold
+    [ line' $ "define i32 @main() {"
+    , body
+    , line' "}"
+    ]
+
+-- -------------------- Doc formatting utils/pretty printers --------------------
+
+type Str = DList Char -- For efficient catenation
+
+-- Indentation as input
+type Doc = Reader Str Str
+deriving instance Semigroup a => Semigroup (Reader r a)
+deriving instance Monoid a => Monoid (Reader r a)
+
+show' :: Show a => a -> Str
+show' = D.fromList . show
+
+show'' :: Show a => a -> Doc
+show'' = pure . show'
+
+runDoc :: Doc -> String
+runDoc c = D.toList $ c `runReader` ""
+
+instance IsString Doc where fromString = pure . D.fromList
+
+indent :: Doc -> Doc
+indent = local ("  " <>)
+
+line :: Str -> Doc
+line l = reader $ \ s -> s <> l <> "\n"
+
+line' :: Doc -> Doc
+line' l = reader $ \ s -> s <> runReader l s <> "\n"
+
+calate :: Doc -> [Doc] -> Doc
+calate sep ds = F.fold (L.intersperse sep ds)
+
+commaSep :: [Doc] -> Doc
+commaSep = calate ", "
+
+class PP a where pp :: a -> Doc
+
+instance PP PTy where
+  pp = \case
+    I w -> "i" <> show'' w
+    Half -> "half"
+    Float -> "float"
+    Double -> "double"
+    FP128 -> "FP128"
+    Ptr t -> "&" <> pp t
+
+instance PP Ty where
+  pp = \case
+    Void -> "void"
+    PTy t -> pp t
+    Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
+    Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
+    Tup ts -> "{" <> commaSep (map pp ts) <> "}"
+    FPtr ts t -> "(fun (" <> commaSep (map pp ts) <> ") -> " <> pp t <> ")"
+
+instance PP (Func a) where
+  pp (Func _ f xts t e) =
+    let xts' = map (\ (_, x, t) -> show'' x <> ": " <> pp t) xts in
+    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " =" <> indent (pp e)
+
+instance PP Prim where
+  pp = \case
+    Add -> "add"
+    Mul -> "mul"
+    Sub -> "sub"
+    Div -> "div"
+
+instance PP (Exp a) where pp = undefined
+
 -- -------------------- Parsing utils --------------------
 
 newtype PError = PError String deriving (Eq, Ord)
@@ -824,28 +948,34 @@ parse :: String -> Either String (Exp ParseAnn) = parse' ""
 parseFile :: FilePath -> IO (Either String (Exp ParseAnn))
 parseFile f = parse' f <$> readFile f
 
--- -- -- -------------------- Compilation to C --------------------
--- -- 
--- -- transpile :: String -> IO (Either String String)
--- -- transpile s = mapM codeGen (parse s)
--- -- 
--- -- transpileFile :: FilePath -> IO (Either String String)
--- -- transpileFile f = parseFile f >>= \case
--- --   Left err -> return $ Left err
--- --   Right p -> Right <$> codeGen p
--- -- 
--- -- -- -------------------- Full compilation --------------------
--- -- 
--- -- compile :: String -> FilePath -> FilePath -> IO ()
--- -- compile s cOut binOut = transpile s >>= \case
--- --   Left err -> putStrLn err
--- --   Right c -> do
--- --     writeFile cOut c
--- --     let flags = ["-O2", "-g", "-I", "runtime", "runtime/gt_switch.s", cOut, "-o", binOut]
--- --     P.createProcess (P.proc "gcc" flags)
--- --     return ()
--- -- 
--- -- compileFile :: FilePath -> FilePath -> FilePath -> IO ()
--- -- compileFile piIn cOut binOut = do
--- --   s <- readFile piIn
--- --   compile s cOut binOut
+-- -------------------- Full compilation --------------------
+
+compile :: String -> Either String String
+compile s = do
+  anf <- fmap (annoFV . toTails . toANF) . runTC . (`check` PTy (I 32)) =<< (ub <$> parse s)
+  let graph = graphOf anf
+  let vars = sortedFVars anf
+  let bbs = inferBBs graph vars
+  first show $ checkBBs graph bbs
+  return . runDoc $ mainG graph bbs anf
+
+-- compileFile :: FilePath -> IO (Either String String)
+-- compileFile f = parseFile f >>= \case
+--   Left err -> return $ Left err
+--   Right p -> Right <$> codeGen p
+
+-- -- -------------------- Full compilation --------------------
+-- 
+-- compile :: String -> FilePath -> FilePath -> IO ()
+-- compile s cOut binOut = transpile s >>= \case
+--   Left err -> putStrLn err
+--   Right c -> do
+--     writeFile cOut c
+--     let flags = ["-O2", "-g", "-I", "runtime", "runtime/gt_switch.s", cOut, "-o", binOut]
+--     P.createProcess (P.proc "gcc" flags)
+--     return ()
+-- 
+-- compileFile :: FilePath -> FilePath -> FilePath -> IO ()
+-- compileFile piIn cOut binOut = do
+--   s <- readFile piIn
+--   compile s cOut binOut

@@ -86,3 +86,4 @@ main = do
   let bbs = liftA2 inferBBs graph fvars
   either putStrLn print bbs
   either putStrLn print (liftA2 checkBBs graph bbs)
+  either putStrLn putStrLn $ compile mult

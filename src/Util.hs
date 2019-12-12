@@ -14,6 +14,9 @@ acciM xs e f = snd <$> foldM (\ (i, b) a -> (i + 1, ) <$> f i b a) (0, e) xs
 for2 :: [a] -> [b] -> (a -> b -> c) -> [c]
 for2 xs ys f = zipWith f xs ys
 
+for :: [a] -> (a -> b) -> [b]
+for xs f = map f xs
+
 (∪) :: Ord a => Set a -> Set a -> Set a
 (∪) = S.union
 
