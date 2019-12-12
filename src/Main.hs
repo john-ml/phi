@@ -87,3 +87,17 @@ main = do
   either putStrLn print bbs
   either putStrLn print (liftA2 checkBBs graph bbs)
   either putStrLn putStrLn $ compile mult
+  let fib = unlines
+       [ "rec fib(n: i32): i256 ="
+       , "  let x: i256 = add(0i256, 0i256) in" -- To force φ-nodes
+       , "  rec go(n: i32, a: i256, b: i256): i256 ="
+       , "    case n {"
+       , "      0 => a,"
+       , "      _ => go(sub(n, 1i32), add(x, b), add(a, b))"
+       , "    }"
+       , "  in go(n, 0i256, 1i256)"
+       , "in"
+       , "let res: i256 = fib(100i32) in"
+       , "0i32"
+       ]
+  either putStrLn putStrLn $ compile fib
