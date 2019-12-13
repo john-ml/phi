@@ -1,4 +1,4 @@
-module Core where
+module Phi where
 
 import Prelude hiding ((!!))
 

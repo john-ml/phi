@@ -1,4 +1,4 @@
-import Core
+import Phi
 import Data.Functor
 import Control.Applicative
 

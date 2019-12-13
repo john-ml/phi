@@ -12,3 +12,12 @@ Taking advantage of the fact that SSA happens to look
 this is a simple functional language which essentially allows one to write programs directly
 in LLVM IR. The programs are just dressed up in ML syntax and written as mutually recursive
 functions to make it bearable for humans.
+
+Todo:
+- [x] Parser, typechecker, and code generator for integer arithmetic + recursive functions
+- [ ] More aggressive basic block selection
+- [ ] Pointers and mutation
+- [ ] Aggregates (structs, vectors, arrays)
+- [ ] Extern declarations
+- [ ] Type aliases
+- [ ] (Recursive) type declarations

@@ -7,7 +7,7 @@ build-type:     Simple
 executable phi-exe
   main-is: Main.hs
   other-modules:
-      Core, Util
+      Phi, Util
   hs-source-dirs:
       src
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
