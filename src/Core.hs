@@ -646,13 +646,11 @@ type BBM = Map Var (Set Var)
 inferBBs :: Map Var (Set Var) -> CallGraph BVAnn -> [Component] -> ANF BVAnn -> BBs
 inferBBs bvs graph vars e = M.keysSet $ go vars `execState` initial e where
   flow :: Set Var -> Var -> State BBM Bool
-  flow fv caller = let bv = maybe S.empty id (bvs M.!? caller) in traceShow ("flow", fv, bv, caller) $
-    if fv ⊆ maybe S.empty id (bvs M.!? caller) then
-      return False
-    else
-      (caller `M.notMember`) <$> get <* modify'' (M.insertWith (∪) caller fv)
+  flow fv caller
+    | fv ⊆ maybe S.empty id (bvs M.!? caller) = return False
+    | otherwise = (caller `M.notMember`) <$> get <* modify' (M.insertWith (∪) caller fv)
   goVar :: Var -> Set Var -> State BBM Bool
-  goVar x fv = traceShow ("goVar", x, fv) $ do
+  goVar x fv = do
     bbm <- get
     if x `M.notMember` bbm then
       return False
@@ -664,12 +662,12 @@ inferBBs bvs graph vars e = M.keysSet $ go vars `execState` initial e where
     bbm <- get
     case bbm M.!? x of
       Nothing
-        | not (S.null fv) -> modify'' (M.insertWith (∪) x fv) *> goVar x fv $> True
+        | not (S.null fv) -> modify' (M.insertWith (∪) x fv) *> goVar x fv $> True
         | otherwise -> goVar x fv
       Just fv' -> goVar x fv'
   goSCC :: [FVar] -> State BBM ()
   goSCC xs = do
-    p <- or <$> mapM (\ a -> traceShow ("goFVar", a) (goFVar a)) xs
+    p <- or <$> mapM goFVar xs
     when p (void $ goSCC xs)
   goComp :: Component -> State BBM ()
   goComp = \case
@@ -677,10 +675,6 @@ inferBBs bvs graph vars e = M.keysSet $ go vars `execState` initial e where
     SCC xs -> goSCC xs
   go :: [Component] -> State BBM ()
   go = mapM_ goComp
-  modify'' f = do
-    st <- get
-    let res = f st
-    traceShow res (put res)
   initial = \case
     AHalt _ -> M.empty
     APrim _ _ _ _ _ e -> initial e
@@ -1067,7 +1061,7 @@ compile s = do
   let graph = graphOf anf
   let vars = sortedFVars anf
   let bvs = bvsOf anf
-  let bbs = inferBBs (traceShow (names, bvs) bvs) graph (traceShow vars vars) anf
+  let bbs = inferBBs bvs graph vars anf
   first show $ checkBBs graph bbs
   return . runDoc $ mainG graph bbs anf
 
