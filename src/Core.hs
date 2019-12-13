@@ -852,10 +852,10 @@ indent :: Doc -> Doc
 indent = local ("  " <>)
 
 line :: Str -> Doc
-line l = reader $ \ s -> s <> l <> "\n"
+line l = reader $ \ s -> "\n" <> s <> l
 
 line' :: Doc -> Doc
-line' l = reader $ \ s -> s <> runReader l s <> "\n"
+line' l = reader $ \ s -> "\n" <> s <> runReader l s
 
 calate :: Doc -> [Doc] -> Doc
 calate sep ds = F.fold (L.intersperse sep ds)
@@ -883,11 +883,6 @@ instance PP Ty where
     Tup ts -> "{" <> commaSep (map pp ts) <> "}"
     FPtr ts t -> pp t <> "(" <> commaSep (map pp ts) <> ")*"
 
-instance PP (Func a) where
-  pp (Func _ f xts t e) =
-    let xts' = map (\ (_, x, t) -> show'' x <> ": " <> pp t) xts in
-    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " =" <> indent (pp e)
-
 instance PP Prim where
   pp = \case
     Add -> "add"
@@ -895,7 +890,97 @@ instance PP Prim where
     Sub -> "sub"
     Div -> "div"
 
-instance PP (Exp a) where pp = undefined
+instance PP (Func a) where
+  pp (Func _ f xts t e) =
+    let xts' = map (\ (_, x, t) -> show'' x <> ": " <> pp t) xts in
+    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " = " <> indent (pp e)
+
+instance PP (Exp a) where
+  pp = \case
+    Var _ x -> show'' x
+    Int _ i w -> show'' i <> "i" <> show'' w
+    Ann _ e ty -> pp e <> ": " <> pp ty
+    Prim _ p es -> pp p <> "(" <> commaSep (map (indent . pp) es) <> ")"
+    Coerce _ e ty -> pp e <> " as " <> pp ty
+    Let _ x t e1 e -> F.fold
+      [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
+      , indent (pp e1)
+      , line' $ "in "
+      , pp e
+      ]
+    Call _ f es -> pp f <> "(" <> commaSep (map (indent . pp) es) <> ")"
+    Case _ e apes -> F.fold
+      [ line' $ "case " <> pp e <> " {"
+      , indent $ commaSep (map goArm apes)
+      , line' $ "}"
+      ]
+      where
+        goArm = \case
+          Just x :=> e -> line' $ show'' x <> " => " <> indent (pp e)
+          Nothing :=> e -> line' $ "_ => " <> indent (pp e)
+    Rec _ fs e -> F.fold
+      [ line' $ goFuncs "rec " fs
+      , line' $ "in "
+      , pp e
+      ]
+      where
+        goFuncs _ [] = ""
+        goFuncs keyword [Func _ f axts t e] = F.fold
+          [ keyword <> show'' f <> "(" <> commaSep (map goArg axts) <> "): " <> pp t <> " = "
+          , indent $ pp e
+          ]
+          where goArg (_, x, t) = show'' x <> ": " <> pp t
+        goFuncs keyword (f : fs) = F.fold
+          [ goFuncs keyword [f]
+          , line' $ goFuncs "and " fs
+          ]
+
+instance PP (Atom a) where
+  pp = \case
+    AVar _ x -> show'' x
+    AInt _ i w -> show'' i <> "i" <> show'' w
+
+instance PP (AFunc a) where
+  pp (AFunc _ f xts t e) =
+    let xts' = map (\ (_, x, t) -> show'' x <> ": " <> pp t) xts in
+    show'' f <> "(" <> commaSep xts' <> "): " <> pp t <> " = " <> indent (pp e)
+
+instance PP (ANF a) where
+  pp = \case
+    AHalt a -> line' $ "ret " <> pp a
+    APrim _ x t p ys e -> bind x t (pp p <> "(" <> commaSep (map pp ys) <> ")") e
+    ACoerce _ x t y e -> bind x t ("coerce " <> pp y) e
+    ACall _ x t f ys e -> bind x t (pp f <> "(" <> commaSep (map pp ys) <> ")") e
+    ATail _ x t f ys ->
+      line' $ "ret " <> show'' x <> ": " <> pp t <> " = "
+        <> pp f <> "(" <> commaSep (map pp ys) <> ")"
+    ACase _ x lpes -> F.fold
+      [ line' $ "case " <> pp x <> " {"
+      , indent $ commaSep (map goArm lpes)
+      , line' $ "}"
+      ]
+      where
+        goArm = \case
+          (l, (Just x, e)) -> line' $ show'' x <> " => " <> show'' l <> ": " <> indent (pp e)
+          (l, (Nothing, e)) -> line' $ "_ => " <> show'' l <> ": " <> indent (pp e)
+    ARec _ fs l e -> F.fold
+      [ line' $ goFuncs "rec " fs
+      , line' $ "in "
+      , line' $ show'' l <> ": "
+      , indent $ pp e
+      ]
+      where
+        goFuncs _ [] = ""
+        goFuncs keyword [AFunc _ f axts t e] = F.fold
+          [ keyword <> show'' f <> "(" <> commaSep (map goArg axts) <> "): " <> pp t <> " = "
+          , indent $ pp e
+          ] where goArg (_, x, t) = show'' x <> ": " <> pp t
+        goFuncs keyword (f : fs) = F.fold
+          [ goFuncs keyword [f]
+          , line' $ goFuncs "and " fs
+          ]
+    where
+      bind x t d1 e = line' $ "let " <> show'' x <> ": " <> pp t <> " = " <> d1 <> " in " <> pp e
 
 -- -------------------- Parsing utils --------------------
 
@@ -946,20 +1031,15 @@ word = do
   guard . not $ s `elem` keywords
   return s
 
-varP' :: Bool -> Parser Var
-varP' strict = do
+varP :: Parser Var
+varP = do
   x <- word
   (M.!? x) <$> get >>= \case
-    Nothing | strict ->
-      P.customFailure . PError $ "Variable not in scope: " ++ x
     Nothing -> do
       n <- fromIntegral . M.size <$> get
       modify' (M.insert x n)
       return n
     Just n -> return n
-
-bindP :: Parser Var = varP' False
-varP :: Parser Var = bindP
 
 wordP :: Parser Word = read <$> lexeme (P.takeWhile1P (Just "digit") isDigit)
 
@@ -1003,10 +1083,10 @@ locP :: Parser ParseAnn = (\ pos -> loc .==. pos .*. emptyRecord) <$> P.getSourc
 funcP :: Parser (Func ParseAnn)
 funcP =
   Func
-    <$> locP <*> bindP <*> tupleOf argP <* symbol ":" <*> tyP <* symbol "="
+    <$> locP <*> varP <*> tupleOf argP <* symbol ":" <*> tyP <* symbol "="
     <*> expP
   where
-    argP = (,,) <$> locP <*> bindP <* symbol ":" <*> tyP
+    argP = (,,) <$> locP <*> varP <* symbol ":" <*> tyP
 
 armP :: Parser (Arm ParseAnn)
 armP = (:=>) <$> (tryAll [Just <$> intP, symbol "_" $> Nothing]) <* symbol "=>" <*> expP
@@ -1018,7 +1098,7 @@ expP = do
     [ Int loc <$> intP <* symbol "i" <*> widthP
     , Prim loc <$> primP <*> tupleOf expP
     , symbol "let" >> Let loc
-        <$> bindP <* symbol ":" <*> tyP <* symbol "="
+        <$> varP <* symbol ":" <*> tyP <* symbol "="
         <*> expP <* symbol "in" <*> expP
     , symbol "case" >> Case loc <$> expP <*> braces (armP `P.sepBy` symbol ",")
     , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
@@ -1047,7 +1127,8 @@ parseFile f = fst . parse' f <$> readFile f
 compile :: String -> Either String String
 compile s = do
   let (r, names) = parse' "" s
-  anf <- fmap (annoBV . annoFV . toTails . toANF) . runTC . (`check` PTy (I 32)) =<< fmap ub r
+  e <- ub <$> r
+  anf <- annoBV . annoFV . toTails . toANF <$> runTC (check e (PTy (I 32)))
   let graph = graphOf anf
   let vars = sortedVars graph
   let bvs = bvsOf anf
