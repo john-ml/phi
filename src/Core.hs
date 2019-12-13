@@ -119,7 +119,7 @@ data Exp a
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
-makeLabelable "loc hasUB typ fvSet bvSet"
+makeLabelable "loc hasUB typ fvSet bvSet hasTail"
 
 -- Every expression node has an annotation
 anno :: Exp a -> a
@@ -155,9 +155,13 @@ type TyAnn = Record TyFields
 typeof :: Exp TyAnn -> Ty
 typeof e = anno e ^. typ
 
--- After TC, convert to ANF.
+-- After TC, convert to ANF and rewrite tail calls into Tail AST nodes.
+data HasTail = HasTail deriving (Eq, Ord, Show)
+type TailFields = Tagged "hasTail" HasTail : TyFields
+type TailAnn = Record TailFields
+
 -- After ANF, label nodes with FV and BV sets...
-type FVFields = Tagged "fvSet" (Set Var) : TyFields
+type FVFields = Tagged "fvSet" (Set Var) : TailFields
 type FVAnn = Record FVFields
 type BVFields = Tagged "bvSet" (Set Var) : FVFields
 type BVAnn = Record BVFields
@@ -449,8 +453,8 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
 
 -- -------------------- Put tail calls into ATail --------------------
 
-toTails :: ANF a -> ANF a
-toTails = go where
+toTails :: ANF TyAnn -> ANF TailAnn
+toTails = fmap (hasTail .==. HasTail .*.) . go where
   go exp = case exp of
     AHalt _ -> exp
     APrim a x t p xs e -> APrim a x t p xs (go e)
@@ -499,11 +503,11 @@ afuncAnno (AFunc a _ _ _ _) = a
 afuncFVs :: AFunc FVAnn -> Set Var
 afuncFVs f = afuncAnno f ^. fvSet
 
-annoFV :: ANF TyAnn -> ANF FVAnn
+annoFV :: ANF TailAnn -> ANF FVAnn
 annoFV = go where
   set s a = fvSet .==. s .*. a
   names = S.fromList . bundleNames
-  goAtom :: Atom TyAnn -> Atom FVAnn
+  goAtom :: Atom TailAnn -> Atom FVAnn
   goAtom = \case
     AVar a x -> AVar (set (S.singleton x) a) x
     AInt a i w -> AInt (set S.empty a) i w
@@ -511,7 +515,7 @@ annoFV = go where
     funcs = names fs
     goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
       AFunc (set (fvs e S.\\ S.fromList (map (\ (_, x, _) -> x) axts) S.\\ funcs) a) f axts t e
-  go :: ANF TyAnn -> ANF FVAnn
+  go :: ANF TailAnn -> ANF FVAnn
   go = \case
     AHalt x -> AHalt (goAtom x)
     APrim a x t p (map goAtom -> xs) (go -> e) ->
