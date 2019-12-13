@@ -119,7 +119,7 @@ data Exp a
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
-makeLabelable "loc hasUB typ fvSet"
+makeLabelable "loc hasUB typ fvSet bvSet"
 
 -- Every expression node has an annotation
 anno :: Exp a -> a
@@ -156,9 +156,11 @@ typeof :: Exp TyAnn -> Ty
 typeof e = anno e ^. typ
 
 -- After TC, convert to ANF.
--- After ANF, label nodes with FV sets...
+-- After ANF, label nodes with FV and BV sets...
 type FVFields = Tagged "fvSet" (Set Var) : TyFields
 type FVAnn = Record FVFields
+type BVFields = Tagged "bvSet" (Set Var) : FVFields
+type BVAnn = Record BVFields
 
 -- ...compute the call graph...
 data FnCall a = FnCall
@@ -486,7 +488,6 @@ aAnno = \case
   AStore a _ _ _ _ -> a
   AUpdate a _ _ _ _ _  -> a
 
-fvs :: ANF FVAnn -> Set Var
 fvs e = aAnno e ^. fvSet
 
 atomFVs :: Atom FVAnn -> Set Var
@@ -526,9 +527,62 @@ annoFV = go where
     ARec a (goAFuncs -> fs) l (go -> e) ->
       ARec (set ((foldMap afuncFVs fs ∪ fvs e) S.\\ names fs) a) fs l e
 
+-- -------------------- Annotate with variables bound under each subexpr --------------------
+
+bvs :: ANF BVAnn -> Set Var
+bvs e = aAnno e ^. bvSet
+
+atomBVs :: Atom BVAnn -> Set Var
+atomBVs x = atomAnno x ^. bvSet
+
+afuncBVs :: AFunc BVAnn -> Set Var
+afuncBVs f = afuncAnno f ^. bvSet
+
+annoBV :: ANF FVAnn -> ANF BVAnn
+annoBV = go where
+  set s a = bvSet .==. s .*. a
+  names = S.fromList . bundleNames
+  goAtom :: Atom FVAnn -> Atom BVAnn
+  goAtom = \case
+    AVar a x -> AVar (set S.empty a) x
+    AInt a i w -> AInt (set S.empty a) i w
+  goAFuncs fs = map goAFunc fs where
+    funcs = names fs
+    goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
+      AFunc (set (bvs e ∪ S.fromList (map (\ (_, x, _) -> x) axts) ∪ funcs) a) f axts t e
+  go :: ANF FVAnn -> ANF BVAnn
+  go = \case
+    AHalt x -> AHalt (goAtom x)
+    APrim a x t p (map goAtom -> xs) (go -> e) ->
+      APrim (set (S.insert x (bvs e)) a) x t p xs e
+    ACoerce a x t (goAtom -> y) (go -> e) ->
+      ACoerce (set (S.insert x (bvs e)) a) x t y e
+    ACall a x t (goAtom -> f) (map goAtom -> xs) (go -> e) ->
+      ACall (set (S.insert x (bvs e)) a) x t f xs e
+    ATail a x t (goAtom -> f) (map goAtom -> xs) ->
+      ATail (set (S.singleton x) a) x t f xs
+    ACase a (goAtom -> x) (map (fmap (fmap go)) -> pes) ->
+      ACase (set (foldMap (bvs . snd . snd) pes) a) x pes
+    ARec a (goAFuncs -> fs) l (go -> e) ->
+      ARec (set (foldMap afuncBVs fs ∪ bvs e) a) fs l e
+
+-- Get names of bvs for each function/label
+bvsOf :: ANF BVAnn -> Map Var (Set Var)
+bvsOf = go where
+  go = \case
+    AHalt _ -> M.empty
+    APrim _ _ _ _ _ e -> go e
+    ACoerce _ _ _ _ e -> go e
+    ACall _ _ _ _ _ e -> go e
+    ATail _ _ _ _ _ -> M.empty
+    ACase _ _ xpes -> foldr (\ (x, (_, e)) m -> M.insert x (bvs e) m <> go e) M.empty xpes
+    ARec _ fs l e -> M.insert l (bvs e) $ foldr accAFunc M.empty fs where
+      accAFunc (AFunc _ f axts t e) m =
+        M.insert f (S.fromList (bundleNames fs ++ map (\ (_, x, _) -> x) axts) ∪ bvs e) m
+
 -- -------------------- Call graph construction --------------------
 
-graphOf :: ANF FVAnn -> CallGraph FVAnn
+graphOf :: ANF BVAnn -> CallGraph BVAnn
 graphOf = go Nothing where
   union = M.unionWith (∪)
   gather = foldr union M.empty
@@ -540,24 +594,26 @@ graphOf = go Nothing where
   goAFuncs = foldr (union . goAFunc) M.empty
   go callerOf = \case
     AHalt _ -> M.empty
-    APrim _ _ _ _ _ e -> go' e
-    ACoerce _ _ _ _ e -> go' e
+    APrim _ _ _ _ _ e -> go callerOf e
+    ACoerce _ _ _ _ e -> go callerOf e
     ACall ((^. loc) -> locOf) x _ (AVar _ f) actualsOf e ->
-      add f (FnCall {locOf, isTail = False, callerOf, actualsOf}) (go' e)
+      add f (FnCall {locOf, isTail = False, callerOf, actualsOf}) (go callerOf e)
     ATail ((^. loc) -> locOf) x _ (AVar _ f) actualsOf ->
       M.singleton f . S.singleton $ FnCall {locOf, isTail = True, callerOf, actualsOf}
-    ACase _ _ pes -> foldr (\ (x, (_, e)) r -> go (Just x) e `union` r) M.empty pes
-    ARec _ fs l e -> goAFuncs fs `union` go (Just l) e
-    where go' = go callerOf
+    ACase ((^. loc) -> locOf) _ pes -> foldr goPes M.empty pes where
+      goPes (x, (_, e)) r = add x fncall $ go (Just x) e `union` r
+      fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
+    ARec ((^. loc) -> locOf) fs l e -> add l fncall $ goAFuncs fs `union` go (Just l) e where
+      fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
 
 -- -------------------- Toposort vars --------------------
 
 type FVar = (Var, Set Var) -- Store fn name + free variables it closes over
 data Component = Sing FVar | SCC [FVar] deriving (Eq, Ord, Show)
 
-sortedFVars :: ANF FVAnn -> [Component]
+sortedFVars :: ANF BVAnn -> [Component]
 sortedFVars = D.toList . go where
-  go :: ANF FVAnn -> DList Component
+  go :: ANF BVAnn -> DList Component
   go = \case
     AHalt _ -> D.fromList []
     APrim a x _ _ _ e -> go e
@@ -565,38 +621,75 @@ sortedFVars = D.toList . go where
     ACall a x _ _ _ e -> go e
     ATail a x _ _ _ -> D.fromList []
     ACase _ _ xpes -> foldMap (\ (_, (_, e)) -> go e) xpes
-    ARec _ fs _ e -> D.cons (SCC (map goF fs)) (foldMap goAFunc fs <> go e) where
-      goF (AFunc a f _ _ _) = (f, a^.fvSet)
-      goAFunc (AFunc _ _ _ _ e) = go e
+    ARec _ fs l e ->
+      SCC (D.toList $ foldMap goF fs)
+        `D.cons` (foldMap goAFunc fs <> (Sing (l, fvs e) `D.cons` go e))
+      where
+        goF (AFunc a f _ _ e) = (f, a^.fvSet) `D.cons` labelsOf e
+        goAFunc (AFunc _ _ _ _ e) = go e
+        -- Crude, but works for now. The labels are a part of the call graph too.
+        labelsOf = \case
+          AHalt _ -> D.fromList []
+          APrim _ _ _ _ _ e -> labelsOf e
+          ACoerce _ _ _ _ e -> labelsOf e
+          ACall _ _ _ _ _ e -> labelsOf e
+          ATail _ _ _ _ _ -> D.fromList []
+          ACase _ _ xpes ->
+            D.fromList (map (\ (x, (_, e)) -> (x, fvs e)) xpes)
+              <> foldMap (labelsOf . snd . snd) xpes
+          ARec _ _ l e -> (l, fvs e) `D.cons` labelsOf e
 
 -- -------------------- Determine which functions should be BBs --------------------
 
-inferBBs :: CallGraph FVAnn -> [Component] -> BBs
-inferBBs graph vars = go vars `execState` S.empty where
-  flow :: Var -> State BBs Bool
-  flow caller = (caller ∉) <$> get <* modify' (S.insert caller)
-  goVar :: Var -> State BBs Bool
-  goVar x = do
-    bbs <- get
-    if x ∉ bbs then
+type BBM = Map Var (Set Var)
+
+inferBBs :: Map Var (Set Var) -> CallGraph BVAnn -> [Component] -> ANF BVAnn -> BBs
+inferBBs bvs graph vars e = M.keysSet $ go vars `execState` initial e where
+  flow :: Set Var -> Var -> State BBM Bool
+  flow fv caller = let bv = maybe S.empty id (bvs M.!? caller) in traceShow ("flow", fv, bv, caller) $
+    if fv ⊆ maybe S.empty id (bvs M.!? caller) then
+      return False
+    else
+      (caller `M.notMember`) <$> get <* modify'' (M.insertWith (∪) caller fv)
+  goVar :: Var -> Set Var -> State BBM Bool
+  goVar x fv = traceShow ("goVar", x, fv) $ do
+    bbm <- get
+    if x `M.notMember` bbm then
       return False
     else case graph M.!? x of
-      Just (catMaybes . map callerOf . S.toList -> callers) -> or <$> mapM flow callers
+      Just (catMaybes . map callerOf . S.toList -> callers) -> or <$> mapM (flow fv) callers
       Nothing -> return False
-  goFVar :: FVar -> State BBs Bool
+  goFVar :: FVar -> State BBM Bool
   goFVar (x, fv) = do
-    when (not (S.null fv)) $ modify' (S.insert x)
-    goVar x
-  goSCC :: [FVar] -> State BBs ()
+    bbm <- get
+    case bbm M.!? x of
+      Nothing
+        | not (S.null fv) -> modify'' (M.insertWith (∪) x fv) *> goVar x fv $> True
+        | otherwise -> goVar x fv
+      Just fv' -> goVar x fv'
+  goSCC :: [FVar] -> State BBM ()
   goSCC xs = do
-    p <- or <$> mapM goFVar xs
+    p <- or <$> mapM (\ a -> traceShow ("goFVar", a) (goFVar a)) xs
     when p (void $ goSCC xs)
-  goComp :: Component -> State BBs ()
+  goComp :: Component -> State BBM ()
   goComp = \case
     Sing x -> void $ goFVar x
     SCC xs -> goSCC xs
-  go :: [Component] -> State BBs ()
+  go :: [Component] -> State BBM ()
   go = mapM_ goComp
+  modify'' f = do
+    st <- get
+    let res = f st
+    traceShow res (put res)
+  initial = \case
+    AHalt _ -> M.empty
+    APrim _ _ _ _ _ e -> initial e
+    ACoerce _ _ _ _ e -> initial e
+    ACall _ _ _ _ _ e -> initial e
+    ATail _ _ _ _ _ -> M.empty
+    ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> M.insert x (fvs e) (initial e)) xpes
+    ARec _ fs l e -> foldr accAFunc (M.insert l (fvs e) (initial e)) fs where
+      accAFunc (AFunc _ _ _ _ e) m = initial e <> m
 
 -- -------------------- Check that BBs only called in tail position --------------------
 
@@ -606,7 +699,7 @@ instance Show BBErr where
   show (NotTail pos) = P.sourcePosPretty pos ++ ": " ++ msg where
     msg = "this function belongs in a basic block and can only be called in tail position"
 
-checkBBs :: CallGraph FVAnn -> BBs -> Either BBErr ()
+checkBBs :: CallGraph BVAnn -> BBs -> Either BBErr ()
 checkBBs graph bbs = forM_ bbs $ \ x ->
   case graph M.!? x of
     Just calls -> forM_ calls $ \ (FnCall {isTail, locOf}) ->
@@ -632,7 +725,7 @@ gvarG x = "@f" <> show'' x
 inst :: Doc -> Doc
 inst = indent . line' 
 
-expG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> GenM Doc
+expG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> GenM Doc
 expG graph bbs = go where
   varG' :: Var -> GenM Doc
   varG' x = do known <- ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
@@ -652,7 +745,7 @@ expG graph bbs = go where
   ret e line = (line <>) <$> go e
   tup xs = do xs' <- mapM atomG xs; return $ "(" <> commaSep xs' <> ")"
   ops = fmap commaSep . mapM opG
-  go :: ANF FVAnn -> GenM Doc
+  go :: ANF BVAnn -> GenM Doc
   go = \case
     AHalt x -> inst . ("ret " <>) <$> atomG x
     APrim a x t p xs e -> do
@@ -712,13 +805,13 @@ expG graph bbs = go where
   goAFunc (AFunc a f axts t e)
     | f ∈ bbs = do
         let
-          calls :: [FnCall FVAnn] =
+          calls :: [FnCall BVAnn] =
             case graph M.!? f of
               Just x -> S.toList x
               Nothing -> error "Incomplete call graph"
           callers = callerOf <$> calls
           actualss = actualsOf <$> calls
-          actualss' :: [[(Maybe Var, Atom FVAnn)]] =
+          actualss' :: [[(Maybe Var, Atom BVAnn)]] =
             L.transpose (zipWith (\ caller actuals -> (caller,) <$> actuals) callers actualss)
           xts :: [(Var, Ty)] = map (\ (_, x, t) -> (x, t)) axts
           mkPhi (x, t) actuals = do
@@ -742,7 +835,7 @@ expG graph bbs = go where
           ]
         return mempty
 
-mainG :: CallGraph FVAnn -> BBs -> ANF FVAnn -> Doc
+mainG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
 mainG graph bbs e =
   let (body, globals) = runWriterT (expG graph bbs e) `runReaderT` S.empty `evalState` 0 in
   globals <> F.fold
@@ -865,7 +958,7 @@ keywords = ["rec", "and", "in", "case", "as"]
 
 word :: Parser String
 word = do
-  s <- lexeme $ some (alphaNumChar <|> char '_')
+  s <- lexeme $ (:) <$> letterChar <*> many (alphaNumChar <|> char '_')
   guard . not $ s `elem` keywords
   return s
 
@@ -881,9 +974,8 @@ varP' strict = do
       return n
     Just n -> return n
 
-varP :: Parser Var = varP' True
-
 bindP :: Parser Var = varP' False
+varP :: Parser Var = bindP
 
 wordP :: Parser Word = read <$> lexeme (P.takeWhile1P (Just "digit") isDigit)
 
@@ -939,8 +1031,7 @@ expP :: Parser (Exp ParseAnn)
 expP = do
   loc <- locP
   e <- tryAll
-    [ Var loc <$> varP
-    , Int loc <$> intP <* symbol "i" <*> widthP
+    [ Int loc <$> intP <* symbol "i" <*> widthP
     , Prim loc <$> primP <*> tupleOf expP
     , symbol "let" >> Let loc
         <$> bindP <* symbol ":" <*> tyP <* symbol "="
@@ -948,6 +1039,7 @@ expP = do
     , symbol "case" >> Case loc <$> expP <*> braces (armP `P.sepBy` symbol ",")
     , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
     , parens expP
+    , Var loc <$> varP
     ]
   tryAll
     [ symbol ":" >> Ann loc e <$> tyP
@@ -956,24 +1048,26 @@ expP = do
     , pure e
     ]
 
-parse' :: String -> String -> Either String (Exp ParseAnn)
+parse' :: String -> String -> (Either String (Exp ParseAnn), Map String Var)
 parse' fname s =
-  first P.errorBundlePretty
-    $ P.runParserT (expP <* P.eof) fname s `evalState` M.empty
+  first (first P.errorBundlePretty)
+    $ P.runParserT (expP <* P.eof) fname s `runState` M.empty
 
-parse :: String -> Either String (Exp ParseAnn) = parse' ""
+parse :: String -> Either String (Exp ParseAnn) = fst . parse' ""
 
 parseFile :: FilePath -> IO (Either String (Exp ParseAnn))
-parseFile f = parse' f <$> readFile f
+parseFile f = fst . parse' f <$> readFile f
 
 -- -------------------- Full compilation --------------------
 
 compile :: String -> Either String String
 compile s = do
-  anf <- fmap (annoFV . toTails . toANF) . runTC . (`check` PTy (I 32)) =<< (ub <$> parse s)
+  let (r, names) = parse' "" s
+  anf <- fmap (annoBV . annoFV . toTails . toANF) . runTC . (`check` PTy (I 32)) =<< fmap ub r
   let graph = graphOf anf
   let vars = sortedFVars anf
-  let bbs = inferBBs graph vars
+  let bvs = bvsOf anf
+  let bbs = inferBBs (traceShow (names, bvs) bvs) graph (traceShow vars vars) anf
   first show $ checkBBs graph bbs
   return . runDoc $ mainG graph bbs anf
 

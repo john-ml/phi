@@ -29,6 +29,9 @@ for xs f = map f xs
 (∉) :: Ord a => a -> Set a -> Bool
 (∉) = S.notMember
 
+(⊆) :: Ord a => Set a -> Set a -> Bool
+(⊆) = S.isSubsetOf
+
 fixed :: (a -> Writer W.Any a) -> a -> a
 fixed f x =
   let (y, W.Any p) = W.runWriter (f x) in
