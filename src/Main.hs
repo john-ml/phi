@@ -47,11 +47,13 @@ main = do
   let tri'' = annoBV . annoFV . toTails <$> tri'
   either putStrLn print' tri''
   let graph = graphOf <$> tri''
-  let fvars = sortedFVars <$> tri''
+  let fvars = sortedVars <$> tri''
   either putStrLn print graph
   either putStrLn print fvars
+  either putStrLn putStrLn $ compile tri
   let bvs = bvsOf <$> tri''
-  let bbs = liftA4 inferBBs bvs graph fvars tri''
+  let l = liftA4 liveness bvs graph fvars tri''
+  let bbs = inferBBs <$> l
   either putStrLn print bbs
   let mult = unlines
        [ "rec mult(n: i32, m: i32): i32 ="
@@ -68,11 +70,12 @@ main = do
   let mult' = annoBV . annoFV . toTails <$> toANF' mult
   either putStrLn print' mult'
   let graph = graphOf <$> mult'
-  let fvars = sortedFVars <$> mult'
+  let fvars = sortedVars <$> mult'
   either putStrLn print graph
   either putStrLn print fvars
   let bvs = bvsOf <$> mult'
-  let bbs = liftA4 inferBBs bvs graph fvars mult'
+  let l = liftA4 liveness bvs graph fvars mult'
+  let bbs = inferBBs <$> l
   either putStrLn print bbs
   either putStrLn putStrLn $ compile mult
   let multBad = unlines
@@ -87,9 +90,10 @@ main = do
        ]
   let multBad' = annoBV . annoFV . toTails <$> toANF' multBad
   let graph = graphOf <$> multBad'
-  let fvars = sortedFVars <$> multBad'
+  let fvars = sortedVars <$> multBad'
   let bvs = bvsOf <$> multBad'
-  let bbs = liftA4 inferBBs bvs graph fvars multBad'
+  let l = liftA4 liveness bvs graph fvars multBad'
+  let bbs = inferBBs <$> l
   either putStrLn print bbs
   either putStrLn putStrLn $ compile multBad
   let fib = unlines
@@ -106,6 +110,18 @@ main = do
        , "0i32"
        ]
   either putStrLn putStrLn $ compile fib
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec fib(n: i32): i256 ="
+    , "  rec go(n: i32, a: i256, b: i256): i256 ="
+    , "    case n {"
+    , "      0 => a,"
+    , "      _ => go(sub(n, 1i32), b, add(a, b))"
+    , "    }"
+    , "  in go(n, 0i256, 1i256)"
+    , "in"
+    , "let res: i256 = fib(100i32) in"
+    , "0i32"
+    ]
   either putStrLn putStrLn . compile $ unlines
     [ "rec f(g: fun (i32, i32) -> i32, x: i32): i32 = g(x, x) in"
     , "rec k(n: i32, m: i32): i32 = add(mul(n, n), mul(m, m)) in"

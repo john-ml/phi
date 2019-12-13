@@ -1,5 +1,7 @@
 module Core where
 
+import Prelude hiding ((!!))
+
 import Debug.Trace
 import Data.Set (Set); import qualified Data.Set as S
 import Data.Map.Strict (Map); import qualified Data.Map.Strict as M
@@ -115,7 +117,7 @@ data Exp a
 -- - If a function has no live variables upon entry, it can become a global function.
 --   However, if the function is only ever called in tail position, it could become
 --   a basic block instead. This is beneficial as tail calls have to adhere to calling
---   conventions while `br` instructions + φ-nodes don't.
+--   conventions while `br` instructions + φ-nodes don't. (TODO)
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
@@ -533,6 +535,8 @@ annoFV = go where
 
 -- -------------------- Annotate with variables bound under each subexpr --------------------
 
+type BVMap = Map Var (Set Var)
+
 bvs :: ANF BVAnn -> Set Var
 bvs e = aAnno e ^. bvSet
 
@@ -571,18 +575,17 @@ annoBV = go where
       ARec (set (foldMap afuncBVs fs ∪ bvs e) a) fs l e
 
 -- Get names of bvs for each function/label
-bvsOf :: ANF BVAnn -> Map Var (Set Var)
-bvsOf = go where
-  go = \case
-    AHalt _ -> M.empty
-    APrim _ _ _ _ _ e -> go e
-    ACoerce _ _ _ _ e -> go e
-    ACall _ _ _ _ _ e -> go e
-    ATail _ _ _ _ _ -> M.empty
-    ACase _ _ xpes -> foldr (\ (x, (_, e)) m -> M.insert x (bvs e) m <> go e) M.empty xpes
-    ARec _ fs l e -> M.insert l (bvs e) $ foldr accAFunc M.empty fs where
-      accAFunc (AFunc _ f axts t e) m =
-        M.insert f (S.fromList (bundleNames fs ++ map (\ (_, x, _) -> x) axts) ∪ bvs e) m
+bvsOf :: ANF BVAnn -> BVMap
+bvsOf = go M.empty where
+  go m = \case
+    AHalt _ -> m
+    APrim _ _ _ _ _ e -> go m e
+    ACoerce _ _ _ _ e -> go m e
+    ACall _ _ _ _ _ e -> go m e
+    ATail _ _ _ _ _ -> m
+    ACase _ _ xpes -> foldr (\ (x, (_, e)) m -> M.insert x (bvs e) (go m e)) m xpes
+    ARec _ fs l e -> M.insert l (bvs e) $ foldr accAFunc m fs where
+      accAFunc (AFunc a f axts t e) m = M.insert f (a^.bvSet) (go m e)
 
 -- -------------------- Call graph construction --------------------
 
@@ -612,11 +615,10 @@ graphOf = go Nothing where
 
 -- -------------------- Toposort vars --------------------
 
-type FVar = (Var, Set Var) -- Store fn name + free variables it closes over
-data Component = Sing FVar | SCC [FVar] deriving (Eq, Ord, Show)
+data Component = Sing Var | SCC [Var] deriving (Eq, Ord, Show)
 
-sortedFVars :: ANF BVAnn -> [Component]
-sortedFVars = D.toList . go where
+sortedVars :: ANF BVAnn -> [Component]
+sortedVars = D.toList . go where
   go :: ANF BVAnn -> DList Component
   go = \case
     AHalt _ -> D.fromList []
@@ -627,9 +629,9 @@ sortedFVars = D.toList . go where
     ACase _ _ xpes -> foldMap (\ (_, (_, e)) -> go e) xpes
     ARec _ fs l e ->
       SCC (D.toList $ foldMap goF fs)
-        `D.cons` (foldMap goAFunc fs <> (Sing (l, fvs e) `D.cons` go e))
+        `D.cons` (foldMap goAFunc fs <> (Sing l `D.cons` go e))
       where
-        goF (AFunc a f _ _ e) = (f, a^.fvSet) `D.cons` labelsOf e
+        goF (AFunc a f _ _ e) = f `D.cons` labelsOf e
         goAFunc (AFunc _ _ _ _ e) = go e
         -- Crude, but works for now. The labels are a part of the call graph too.
         labelsOf = \case
@@ -639,55 +641,63 @@ sortedFVars = D.toList . go where
           ACall _ _ _ _ _ e -> labelsOf e
           ATail _ _ _ _ _ -> D.fromList []
           ACase _ _ xpes ->
-            D.fromList (map (\ (x, (_, e)) -> (x, fvs e)) xpes)
+            D.fromList (map (\ (x, (_, _)) -> x) xpes)
               <> foldMap (labelsOf . snd . snd) xpes
-          ARec _ _ l e -> (l, fvs e) `D.cons` labelsOf e
+          ARec _ _ l e -> l `D.cons` labelsOf e
 
 -- -------------------- Determine which functions should be BBs --------------------
 
-type BBM = Map Var (Set Var)
+-- Liveness analysis maps a known function to variables live on entry
+type Liveness = Map Var (Set Var)
 
-inferBBs :: Map Var (Set Var) -> CallGraph BVAnn -> [Component] -> ANF BVAnn -> BBs
-inferBBs bvs graph vars e = M.keysSet $ go vars `execState` initial e where
-  flow :: Set Var -> Var -> State BBM Bool
-  flow fv caller
-    | fv ⊆ maybe S.empty id (bvs M.!? caller) = return False
-    | otherwise = (caller `M.notMember`) <$> get <* modify' (M.insertWith (∪) caller fv)
-  goVar :: Var -> Set Var -> State BBM Bool
-  goVar x fv = do
-    bbm <- get
-    if x `M.notMember` bbm then
-      return False
-    else case graph M.!? x of
-      Just (catMaybes . map callerOf . S.toList -> callers) -> or <$> mapM (flow fv) callers
-      Nothing -> return False
-  goFVar :: FVar -> State BBM Bool
-  goFVar (x, fv) = do
-    bbm <- get
-    case bbm M.!? x of
-      Nothing
-        | not (S.null fv) -> modify' (M.insertWith (∪) x fv) *> goVar x fv $> True
-        | otherwise -> goVar x fv
-      Just fv' -> goVar x fv'
-  goSCC :: [FVar] -> State BBM ()
-  goSCC xs = do
-    p <- or <$> mapM goFVar xs
-    when p (void $ goSCC xs)
-  goComp :: Component -> State BBM ()
-  goComp = \case
-    Sing x -> void $ goFVar x
-    SCC xs -> goSCC xs
-  go :: [Component] -> State BBM ()
-  go = mapM_ goComp
-  initial = \case
+(!!) :: (Monoid a, Ord k) => Map k a -> k -> a
+(!!) = flip $ M.findWithDefault mempty
+
+-- Add a live set and report if there was any change
+addLive :: BVMap -> Set Var -> Var -> State Liveness Bool
+addLive bvs gen x = do
+  let kill = bvs !! x
+  let new = gen S.\\ kill
+  old <- (!! x) <$> get
+  if new ⊆ old then
+    return False
+  else
+    modify' (M.insert x (new ∪ old)) $> True
+
+-- Initially, liveness contains all free variables at every label
+initLive :: ANF BVAnn -> Liveness
+initLive = go where
+  go = \case
     AHalt _ -> M.empty
-    APrim _ _ _ _ _ e -> initial e
-    ACoerce _ _ _ _ e -> initial e
-    ACall _ _ _ _ _ e -> initial e
+    APrim _ _ _ _ _ e -> go e
+    ACoerce _ _ _ _ e -> go e
+    ACall _ _ _ _ _ e -> go e
     ATail _ _ _ _ _ -> M.empty
-    ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> M.insert x (fvs e) (initial e)) xpes
-    ARec _ fs l e -> foldr accAFunc (M.insert l (fvs e) (initial e)) fs where
-      accAFunc (AFunc _ _ _ _ e) m = initial e <> m
+    ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> M.insert x (fvs e) (go e)) xpes
+    ARec _ fs l e -> foldr goAFunc (M.insert l (fvs e) (go e)) fs where
+      goAFunc (AFunc a f _ _ e) m = M.insert f (a^.fvSet) (go e <> m)
+
+liveness :: BVMap -> CallGraph BVAnn -> [Component] -> ANF BVAnn -> Liveness
+liveness bvs graph vars e = go vars `execState` initLive e where
+  anyM f xs = or <$> mapM f xs
+  -- Propagate live set xs at x backwards to all callers of x
+  goVar :: Var -> State Liveness Bool
+  goVar x = do
+    gen <- (!! x) <$> get
+    anyM (addLive bvs gen) [x | FnCall {callerOf = Just x} <- S.toList (graph !! x)]
+  -- Fixpoint computation for each SCC in the call graph
+  goSCC :: [Var] -> State Liveness ()
+  goSCC xs = do
+    p <- anyM goVar xs
+    when p (goSCC xs)
+  go :: [Component] -> State Liveness ()
+  go = mapM_ $ \case
+    Sing x -> void $ goVar x
+    SCC xs -> goSCC xs
+
+-- Determine which functions should be BBs based on liveness information
+inferBBs :: Liveness -> BBs
+inferBBs = M.keysSet . M.filter (not . S.null)
 
 -- -------------------- Check that BBs only called in tail position --------------------
 
@@ -698,11 +708,10 @@ instance Show BBErr where
     msg = "this function belongs in a basic block and can only be called in tail position"
 
 checkBBs :: CallGraph BVAnn -> BBs -> Either BBErr ()
-checkBBs graph bbs = forM_ bbs $ \ x ->
-  case graph M.!? x of
-    Just calls -> forM_ calls $ \ (FnCall {isTail, locOf}) ->
+checkBBs graph bbs =
+  forM_ bbs $ \ x ->
+    forM_ (graph !! x) $ \ (FnCall {isTail, locOf}) ->
       when (not isTail) . throwError $ NotTail locOf
-    Nothing -> return ()
 
 -- -------------------- Code generation --------------------
 
@@ -803,10 +812,7 @@ expG graph bbs = go where
   goAFunc (AFunc a f axts t e)
     | f ∈ bbs = do
         let
-          calls :: [FnCall BVAnn] =
-            case graph M.!? f of
-              Just x -> S.toList x
-              Nothing -> error "Incomplete call graph"
+          calls :: [FnCall BVAnn] = S.toList $ graph !! f
           callers = callerOf <$> calls
           actualss = actualsOf <$> calls
           actualss' :: [[(Maybe Var, Atom BVAnn)]] =
@@ -1063,9 +1069,10 @@ compile s = do
   let (r, names) = parse' "" s
   anf <- fmap (annoBV . annoFV . toTails . toANF) . runTC . (`check` PTy (I 32)) =<< fmap ub r
   let graph = graphOf anf
-  let vars = sortedFVars anf
+  let vars = sortedVars anf
   let bvs = bvsOf anf
-  let bbs = inferBBs bvs graph vars anf
+  let l = liveness bvs graph vars anf
+  let bbs = inferBBs l
   first show $ checkBBs graph bbs
   return . runDoc $ mainG graph bbs anf
 
