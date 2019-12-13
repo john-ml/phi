@@ -47,7 +47,7 @@ main = do
   let tri'' = annoBV . annoFV . toTails <$> tri'
   either putStrLn print' tri''
   let graph = graphOf <$> tri''
-  let fvars = sortedVars <$> tri''
+  let fvars = sortedVars <$> graph
   either putStrLn print graph
   either putStrLn print fvars
   either putStrLn putStrLn $ compile tri
@@ -70,7 +70,7 @@ main = do
   let mult' = annoBV . annoFV . toTails <$> toANF' mult
   either putStrLn print' mult'
   let graph = graphOf <$> mult'
-  let fvars = sortedVars <$> mult'
+  let fvars = sortedVars <$> graph
   either putStrLn print graph
   either putStrLn print fvars
   let bvs = bvsOf <$> mult'
@@ -90,7 +90,7 @@ main = do
        ]
   let multBad' = annoBV . annoFV . toTails <$> toANF' multBad
   let graph = graphOf <$> multBad'
-  let fvars = sortedVars <$> multBad'
+  let fvars = sortedVars <$> graph
   let bvs = bvsOf <$> multBad'
   let l = liftA4 liveness bvs graph fvars multBad'
   let bbs = inferBBs <$> l

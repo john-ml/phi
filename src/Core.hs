@@ -29,6 +29,8 @@ import qualified Text.Megaparsec as P
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 
+import qualified Data.Graph as G
+
 import Util
 
 import Data.HList.CommonMain hiding (Any)
@@ -615,35 +617,13 @@ graphOf = go Nothing where
 
 -- -------------------- Toposort vars --------------------
 
-data Component = Sing Var | SCC [Var] deriving (Eq, Ord, Show)
-
-sortedVars :: ANF BVAnn -> [Component]
-sortedVars = D.toList . go where
-  go :: ANF BVAnn -> DList Component
-  go = \case
-    AHalt _ -> D.fromList []
-    APrim a x _ _ _ e -> go e
-    ACoerce a x _ _ e -> go e
-    ACall a x _ _ _ e -> go e
-    ATail a x _ _ _ -> D.fromList []
-    ACase _ _ xpes -> foldMap (\ (_, (_, e)) -> go e) xpes
-    ARec _ fs l e ->
-      SCC (D.toList $ foldMap goF fs)
-        `D.cons` (foldMap goAFunc fs <> (Sing l `D.cons` go e))
-      where
-        goF (AFunc a f _ _ e) = f `D.cons` labelsOf e
-        goAFunc (AFunc _ _ _ _ e) = go e
-        -- Crude, but works for now. The labels are a part of the call graph too.
-        labelsOf = \case
-          AHalt _ -> D.fromList []
-          APrim _ _ _ _ _ e -> labelsOf e
-          ACoerce _ _ _ _ e -> labelsOf e
-          ACall _ _ _ _ _ e -> labelsOf e
-          ATail _ _ _ _ _ -> D.fromList []
-          ACase _ _ xpes ->
-            D.fromList (map (\ (x, (_, _)) -> x) xpes)
-              <> foldMap (labelsOf . snd . snd) xpes
-          ARec _ _ l e -> l `D.cons` labelsOf e
+sortedVars :: CallGraph a -> [G.SCC Var]
+sortedVars g =
+  G.stronglyConnComp
+    [ (x, x, ys)
+    | (x, callers) <- M.toList g
+    , let ys = [y | FnCall {callerOf = Just y} <- S.toList callers]
+    ]
 
 -- -------------------- Determine which functions should be BBs --------------------
 
@@ -677,7 +657,7 @@ initLive = go where
     ARec _ fs l e -> foldr goAFunc (M.insert l (fvs e) (go e)) fs where
       goAFunc (AFunc a f _ _ e) m = M.insert f (a^.fvSet) (go e <> m)
 
-liveness :: BVMap -> CallGraph BVAnn -> [Component] -> ANF BVAnn -> Liveness
+liveness :: BVMap -> CallGraph BVAnn -> [G.SCC Var] -> ANF BVAnn -> Liveness
 liveness bvs graph vars e = go vars `execState` initLive e where
   anyM f xs = or <$> mapM f xs
   -- Propagate live set xs at x backwards to all callers of x
@@ -690,10 +670,10 @@ liveness bvs graph vars e = go vars `execState` initLive e where
   goSCC xs = do
     p <- anyM goVar xs
     when p (goSCC xs)
-  go :: [Component] -> State Liveness ()
+  go :: [G.SCC Var] -> State Liveness ()
   go = mapM_ $ \case
-    Sing x -> void $ goVar x
-    SCC xs -> goSCC xs
+    G.AcyclicSCC x -> void $ goVar x
+    G.CyclicSCC xs -> goSCC xs
 
 -- Determine which functions should be BBs based on liveness information
 inferBBs :: Liveness -> BBs
@@ -1069,7 +1049,7 @@ compile s = do
   let (r, names) = parse' "" s
   anf <- fmap (annoBV . annoFV . toTails . toANF) . runTC . (`check` PTy (I 32)) =<< fmap ub r
   let graph = graphOf anf
-  let vars = sortedVars anf
+  let vars = sortedVars graph
   let bvs = bvsOf anf
   let l = liveness bvs graph vars anf
   let bbs = inferBBs l
