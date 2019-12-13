@@ -712,8 +712,8 @@ gvarG x = "@f" <> show'' x
 inst :: Doc -> Doc
 inst = indent . line' 
 
-expG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> GenM Doc
-expG graph bbs = go where
+anfG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> GenM Doc
+anfG graph bbs = go where
   varG' :: Var -> GenM Doc
   varG' x = do known <- ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
   atomG = \case
@@ -821,7 +821,7 @@ expG graph bbs = go where
 
 mainG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
 mainG graph bbs e =
-  let (body, globals) = runWriterT (expG graph bbs e) `runReaderT` S.empty `evalState` 0 in
+  let (body, globals) = runWriterT (anfG graph bbs e) `runReaderT` S.empty `evalState` 0 in
   globals <> F.fold
     [ line' $ "define i32 @main() {"
     , body
