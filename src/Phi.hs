@@ -621,34 +621,10 @@ graphOf = go Nothing where
     ARec ((^. loc) -> locOf) fs l e -> add l fncall $ goAFuncs fs `union` go (Just l) e where
       fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
 
--- -------------------- Toposort vars --------------------
-
-sortedVars :: CallGraph a -> [G.SCC Var]
-sortedVars g =
-  G.stronglyConnComp
-    [ (x, x, ys)
-    | (x, callers) <- M.toList g
-    , let ys = [y | FnCall {callerOf = Just y} <- S.toList callers]
-    ]
-
 -- -------------------- Determine which functions should be BBs --------------------
 
 -- Liveness analysis maps a known function to variables live on entry
 type Liveness = Map Var (Set Var)
-
-(!!) :: (Monoid a, Ord k) => Map k a -> k -> a
-(!!) = flip $ M.findWithDefault mempty
-
--- Add a live set and report if there was any change
-addLive :: BVMap -> Set Var -> Var -> State Liveness Bool
-addLive bvs gen x = do
-  let kill = bvs !! x
-  let new = gen S.\\ kill
-  old <- (!! x) <$> get
-  if new ⊆ old then
-    return False
-  else
-    modify' (M.insert x (new ∪ old)) $> True
 
 -- Initially, liveness contains all free variables at every label
 initLive :: ANF BVAnn -> Liveness
@@ -663,23 +639,14 @@ initLive = go where
     ARec _ fs l e -> foldr goAFunc (M.insert l (fvs e) (go e)) fs where
       goAFunc (AFunc a f _ _ e) m = M.insert f (a^.fvSet) (go e <> m)
 
-liveness :: BVMap -> CallGraph BVAnn -> [G.SCC Var] -> ANF BVAnn -> Liveness
-liveness bvs graph vars e = go vars `execState` initLive e where
-  anyM f xs = or <$> mapM f xs
-  -- Propagate live set xs at x backwards to all callers of x
-  goVar :: Var -> State Liveness Bool
-  goVar x = do
-    gen <- (!! x) <$> get
-    anyM (addLive bvs gen) [x | FnCall {callerOf = Just x} <- S.toList (graph !! x)]
-  -- Fixpoint computation for each SCC in the call graph
-  goSCC :: [Var] -> State Liveness ()
-  goSCC xs = do
-    p <- anyM goVar xs
-    when p (goSCC xs)
-  go :: [G.SCC Var] -> State Liveness ()
-  go = mapM_ $ \case
-    G.AcyclicSCC x -> void $ goVar x
-    G.CyclicSCC xs -> goSCC xs
+liveness :: BVMap -> CallGraph BVAnn -> ANF BVAnn -> Liveness
+liveness bvs graph e = leastFlowAnno flow adjList (initLive e) where
+  flow gen x = gen S.\\ (bvs !! x)
+  adjList =
+    [ (x, ys)
+    | (x, callers) <- M.toList graph
+    , let ys = [y | FnCall {callerOf = Just y} <- S.toList callers]
+    ]
 
 -- Determine which functions should be BBs based on liveness information
 inferBBs :: Liveness -> BBs
@@ -1101,9 +1068,8 @@ compile s = do
   e <- ub <$> r
   anf <- annoBV . annoFV . toTails . toANF <$> runTC (check e (PTy (I 32)))
   let graph = graphOf anf
-  let vars = sortedVars graph
   let bvs = bvsOf anf
-  let l = liveness bvs graph vars anf
+  let l = liveness bvs graph anf
   let bbs = inferBBs l
   first show $ checkBBs graph bbs
   return . runDoc $ mainG graph bbs anf

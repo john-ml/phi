@@ -14,9 +14,6 @@ toANF' s = fmap (toANF . snd) . runTC . infer =<< (ub <$> parse s)
 testANF :: String -> IO ()
 testANF s = either putStrLn print' (toANF' s)
 
-liftA4 :: Applicative f => (a -> b -> c -> d -> e) -> f a -> f b -> f c -> f d -> f e
-liftA4 f a b c d = f <$> a <*> b <*> c <*> d
-
 main = do
   either putStrLn print' $ parse "3i32"
   either putStrLn print' $ parse "let x: i32 = 3i32 in 4i32"
@@ -47,12 +44,10 @@ main = do
   let tri'' = annoBV . annoFV . toTails <$> tri'
   either putStrLn print' tri''
   let graph = graphOf <$> tri''
-  let fvars = sortedVars <$> graph
   either putStrLn print graph
-  either putStrLn print fvars
   either putStrLn putStrLn $ compile tri
   let bvs = bvsOf <$> tri''
-  let l = liftA4 liveness bvs graph fvars tri''
+  let l = liftA3 liveness bvs graph tri''
   let bbs = inferBBs <$> l
   either putStrLn print bbs
   let mult = unlines
@@ -70,11 +65,9 @@ main = do
   let mult' = annoBV . annoFV . toTails <$> toANF' mult
   either putStrLn print' mult'
   let graph = graphOf <$> mult'
-  let fvars = sortedVars <$> graph
   either putStrLn print graph
-  either putStrLn print fvars
   let bvs = bvsOf <$> mult'
-  let l = liftA4 liveness bvs graph fvars mult'
+  let l = liftA3 liveness bvs graph mult'
   let bbs = inferBBs <$> l
   either putStrLn print bbs
   either putStrLn putStrLn $ compile mult
@@ -90,9 +83,8 @@ main = do
        ]
   let multBad' = annoBV . annoFV . toTails <$> toANF' multBad
   let graph = graphOf <$> multBad'
-  let fvars = sortedVars <$> graph
   let bvs = bvsOf <$> multBad'
-  let l = liftA4 liveness bvs graph fvars multBad'
+  let l = liftA3 liveness bvs graph multBad'
   let bbs = inferBBs <$> l
   either putStrLn print bbs
   either putStrLn putStrLn $ compile multBad

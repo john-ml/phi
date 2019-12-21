@@ -14,7 +14,7 @@ executable phi-exe
   build-depends:
       base >=4.7 && <5,
       containers, mtl, sbv, recursion-schemes, deriving-compat,
-      transformers, dlist, megaparsec, process, HList, lens
+      transformers, dlist, megaparsec, process, HList, lens, semilattices
   default-language: Haskell2010
   default-extensions:
       LambdaCase, DeriveFunctor, DeriveFoldable, DeriveTraversable,
