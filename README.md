@@ -21,3 +21,5 @@ Todo:
 - [ ] Extern declarations
 - [ ] Type aliases
 - [ ] (Recursive) type declarations
+- [ ] Infix parsing
+

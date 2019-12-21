@@ -12,15 +12,13 @@ import qualified Data.Foldable as F
 import Data.Bifunctor
 import Data.Functor
 import Data.Maybe
+import Data.String (IsString (..))
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Writer.Strict
 import Control.Applicative
-
-import Data.String (IsString (..))
-import Data.DList (DList); import qualified Data.DList as D
 
 import Data.Char
 import Data.Void
@@ -111,15 +109,23 @@ data Exp a
 -- - All functions f where some variables are live upon entry to f (i.e., f itself
 --   closes over those variables or calls functions which do) must become basic blocks.
 -- - Specifically, x is live at f if, assuming UB,
---   (1) x ∈ FV(body of f) or
---   (2) f calls g, x is live at g, and x ∉ BV(body of f).
+--     (1) x ∈ FV(body of f) OR
+--     (2) f calls g, x is live at g, and x ∉ BV(body of f).
 -- - All calls to SSA-block functions must be in tail position.
 -- - These tail calls will become `br` instructions and the corresponding functions
 --   will become basic blocks with φ-nodes.
--- - If a function has no live variables upon entry, it can become a global function.
---   However, if the function is only ever called in tail position, it could become
---   a basic block instead. This is beneficial as tail calls have to adhere to calling
---   conventions while `br` instructions + φ-nodes don't. (TODO)
+-- If a function has no live variables upon entry, it can become a global function.
+-- However, it may be beneficial to make some of these functions be basic blocks, because
+-- `br` instructions + φ-nodes don't have to adhere to calling conventions (e.g. if
+-- LLVM has to spill some of the arguments to tail call, it can't be a simple jump anymore.)
+-- To do this, there's an invariant would be useful to preserve: every connected component
+-- of basic blocks must have exactly one "entry point" which is a global function. That is,
+-- if a function f calls a basic block g then for all functions f' and basic blocks h
+-- reachable from g by `br` instructions only, f' calls g ==> f' = f.
+-- - This invariant holds for the BB assignment yielded by liveness analysis: for all
+--   functions f and BBs g where f calls g, f must have killed all variables live at g.
+--   It's impossible for two distinct functions f and f' to call a BB g because both would
+--   have to have killed the same set of variables (violating UB).
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
@@ -260,9 +266,9 @@ instance PP TCErr where
   pp = \case
     NotInScope x -> line $ "Variable not in scope: " <> show' x
     ExGotShape shape ty ->
-      line' $ "Expected " <> pure (D.fromList shape) <> " but got " <> pp ty
+      line' $ "Expected " <> fromString shape <> " but got " <> pp ty
     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
-    Custom s -> line $ D.fromList s
+    Custom s -> line' $ fromString s
 
 type TC =
   ExceptT (P.SourcePos, TCErr)
@@ -828,42 +834,7 @@ mainG graph bbs e =
     , line' "}"
     ]
 
--- -------------------- Doc formatting utils/pretty printers --------------------
-
-type Str = DList Char -- For efficient catenation
-
--- Indentation as input
-type Doc = Reader Str Str
-deriving instance Semigroup a => Semigroup (Reader r a)
-deriving instance Monoid a => Monoid (Reader r a)
-
-show' :: Show a => a -> Str
-show' = D.fromList . show
-
-show'' :: Show a => a -> Doc
-show'' = pure . show'
-
-runDoc :: Doc -> String
-runDoc c = D.toList $ c `runReader` ""
-
-instance IsString Doc where fromString = pure . D.fromList
-
-indent :: Doc -> Doc
-indent = local ("  " <>)
-
-line :: Str -> Doc
-line l = reader $ \ s -> "\n" <> s <> l
-
-line' :: Doc -> Doc
-line' l = reader $ \ s -> "\n" <> s <> runReader l s
-
-calate :: Doc -> [Doc] -> Doc
-calate sep ds = F.fold (L.intersperse sep ds)
-
-commaSep :: [Doc] -> Doc
-commaSep = calate ", "
-
-class PP a where pp :: a -> Doc
+-- -------------------- Pretty printers --------------------
 
 instance PP PTy where
   pp = \case
