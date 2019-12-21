@@ -136,3 +136,38 @@ main = do
     , "in"
     , "even(4i32)"
     ]
+  either putStrLn putStrLn . compile $ "rec f(_: <2 x i32>): i32 = f(<0i32, 1i32>) in 0i32"
+  either putStrLn putStrLn . compile $ "rec f(_: {i32, i32}): i32 = f({0i32, 1i32}) in 0i32"
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
+    , "  f({0i64, {1i32, 2i64}, {<3i32, 4i32>, 5i32}})"
+    , "in 0i32"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
+    , "  f({0i64, {1i32, 2i64}, {<3i32, 4i32>, 5i33}})"
+    , "in 0i32"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
+    , "  f({0i64, {1i32, 2i64}, <3i32, 4i32>})"
+    , "in 0i32"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
+    , "  let x: {i64, {i32, i64}, {<2 x i32>, i32}} = {0i64, {1i32, 2i64}, {<3i32, 4i32>, 5i32}} in"
+    , "  f(x)"
+    , "in 0i32"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(xs: <4 x i32>, ys: <4 x i32>): <4 x i32> = add(xs, ys) in"
+    , "0i32"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(xs: <4 x i32>, ys: <4 x i64>): <4 x i32> = add(xs, ys) in"
+    , "0i32"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(xs: <4 x i32>, ys: <5 x i32>): <4 x i32> = add(xs, ys) in"
+    , "0i32"
+    ]

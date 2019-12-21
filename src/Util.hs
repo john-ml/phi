@@ -50,6 +50,10 @@ fixed f x =
   let (y, W.Any p) = W.runWriter (f x) in
   if p then fixed f y else y
 
+-- -------------------- Pattern synonyms --------------------
+
+pattern p :∧: q <- ((\ x -> (x, x)) -> (p, q))
+
 -- -------------------- Pretty-printing --------------------
 
 type Str = DList Char -- For efficient catenation
@@ -133,10 +137,8 @@ leastFlowAnno f adjList ann = go sccs `execState` ann where
     anyM (flow lab) (succs l)
   -- Update label at given location using flow function
   flow :: lab -> loc -> State ann Bool
-  flow lab loc = do
-    let new = f lab loc
-    old <- (!! loc) <$> get
-    if new ⊑ old then
-      return False
-    else
-      modify' (M.insert loc (new \/ old)) $> True
+  flow lab loc =
+    let new = f lab loc in
+    (!! loc) <$> get >>= \case
+      old | new ⊑ old -> return False
+          | otherwise -> modify' (M.insert loc (new \/ old)) $> True
