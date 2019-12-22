@@ -171,3 +171,4 @@ main = do
     [ "rec f(xs: <4 x i32>, ys: <5 x i32>): <4 x i32> = add(xs, ys) in"
     , "0i32"
     ]
+  either putStrLn putStrLn . compile $ "rec f(xs: [2 x i32]): [2 x i32] = [0i32, 1i32] in 0i32"

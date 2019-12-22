@@ -54,9 +54,9 @@ data PTy
 data Ty
   = Void
   | PTy PTy
-  | Vec Word PTy
   | Arr Word Ty
   | Tup [Ty]
+  | Vec Word PTy
   | FPtr [Ty] Ty
   deriving (Eq, Ord, Show)
 
@@ -96,6 +96,7 @@ data Exp a
   | Case a (Exp a) [Arm a]
   | Rec a [Func a] (Exp a) -- Function bundle
   -- Aggregates
+  | Array a [Exp a]
   | Tuple a [Exp a]
   | Vector a [Exp a]
   | Gep a (Exp a) (Path a) -- &e path (GEP)
@@ -143,6 +144,7 @@ anno = \case
   Call a _ _ -> a
   Case a _ _ -> a
   Rec a _ _ -> a
+  Array a _ -> a
   Tuple a _ -> a
   Vector a _ -> a
 
@@ -211,6 +213,7 @@ foldVars f = \case
   Rec _ fs e -> foldMap foldFunc fs <> foldVars f e where
     foldFunc (Func _ f' axts _ e) =
       f f' <> foldMap (\ (_, x, _) -> f x) axts <> foldVars f e
+  Array _ es -> foldMap (foldVars f) es
   Tuple _ es -> foldMap (foldVars f) es
   Vector _ es -> foldMap (foldVars f) es
 
@@ -252,6 +255,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
         let σ'' = M.fromList (zip xs xs') `M.union` σ'
         Func a (σ' ! f) axts' t <$> go σ'' e
       Rec a helpers' <$> go σ' e
+    Array a es -> Array a <$> mapM (go σ) es
     Tuple a es -> Tuple a <$> mapM (go σ) es
     Vector a es -> Vector a <$> mapM (go σ) es
   σ ! x = M.findWithDefault x x σ
@@ -311,18 +315,17 @@ checkNumOp a = \case
   [] -> raise a . Custom $ "Expected at least one argument"
   (e:es) -> do
     (t, e') <- infer e
-    when (not (numeric t)) . raise a $ ExGotShape "numeric type" t
+    when (not (ok t)) . raise a $ ExGotShape "numeric type or <_ x numeric type>" t
     es' <- mapM (`check` t) es
     return (t, e':es')
   where
+    ok t = numeric t || case t of Vec _ t' -> numeric (PTy t'); _ -> False
     numeric = \case
       PTy (I _) -> True
       PTy Half -> True
       PTy Float -> True
       PTy Double -> True
       PTy FP128 -> True
-      Vec _ t -> numeric (PTy t)
-      Arr _ t -> numeric t
       _ -> False
 
 checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
@@ -370,6 +373,12 @@ infer = \case
         return $ Func (typ .==. Void .*. a) f axts' t e'
       (ty, e') <- infer e
       return (ty, Rec (typ .==. ty .*. a) funcs' e')
+  -- TODO: empty array
+  Array a ((e:es) :∧: (L.genericLength -> n)) -> do
+    (t, e') <- infer e
+    es' <- mapM (`check` t) es
+    let ty = Arr n t
+    return (ty, Array (typ .==. ty .*. a) (e':es'))
   Tuple a es -> do
     (ts, es') <- unzip <$> mapM infer es
     let ty = Tup ts
@@ -387,6 +396,7 @@ infer = \case
 data Atom a
   = AVar a Var
   | AInt a Integer Width
+  | AArr a [Atom a]
   | ATup a [Atom a]
   | AVec a [Atom a]
   deriving (THEUSUAL)
@@ -469,12 +479,9 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       l <- gen'
       put' $ k . ARec a helpers' l
       go σ e
-    Tuple a es -> do
-      es' <- mapM (go σ) es
-      return $ ATup a es'
-    Vector a es -> do
-      es' <- mapM (go σ) es
-      return $ AVec a es'
+    Array a es -> do es' <- mapM (go σ) es; return $ AArr a es'
+    Tuple a es -> do es' <- mapM (go σ) es; return $ ATup a es'
+    Vector a es -> do es' <- mapM (go σ) es; return $ AVec a es'
     where
       σ ! (a, x) = M.findWithDefault (AVar a x) x σ
       gen' = modify' (first succ) >> fst <$> get
@@ -506,6 +513,7 @@ atomAnno :: Atom a -> a
 atomAnno = \case
   AVar a _ -> a
   AInt a _ _ -> a
+  AArr a _ -> a
   ATup a _ -> a
   AVec a _ -> a
 
@@ -542,6 +550,7 @@ annoFV = go where
   goAtom = \case
     AVar a x -> AVar (set (S.singleton x) a) x
     AInt a i w -> AInt (set S.empty a) i w
+    AArr a (map goAtom -> xs) -> AArr (set (foldMap atomFVs xs) a) xs
     ATup a (map goAtom -> xs) -> ATup (set (foldMap atomFVs xs) a) xs
     AVec a (map goAtom -> xs) -> AVec (set (foldMap atomFVs xs) a) xs
   goAFuncs fs = map goAFunc fs where
@@ -585,6 +594,7 @@ annoBV = go where
   goAtom = \case
     AVar a x -> AVar (set S.empty a) x
     AInt a i w -> AInt (set S.empty a) i w
+    AArr a (map goAtom -> xs) -> AArr (set S.empty a) xs
     ATup a (map goAtom -> xs) -> ATup (set S.empty a) xs
     AVec a (map goAtom -> xs) -> AVec (set S.empty a) xs
   goAFuncs fs = map goAFunc fs where
@@ -715,13 +725,13 @@ anfG graph bbs = go where
   varG' :: Var -> GenM Doc
   varG' x = do known <- ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
   args xs = do xs' <- mapM atomG xs; return $ "(" <> commaSep xs' <> ")"
-  tup xs = do xs' <- mapM atomG xs; return $ "{" <> commaSep xs' <> "}"
-  vec xs = do xs' <- mapM atomG xs; return $ "<" <> commaSep xs' <> ">"
+  agg a l r xs = do xs' <- mapM atomG xs; return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
   atomG = \case
     AVar a x -> do x' <- varG' x; return $ pp (a^.typ) <> " " <> x'
     AInt _ i w -> return $ "i" <> show'' w <> " " <> show'' i
-    ATup a xs -> do xs' <- tup xs; return $ pp (a^.typ) <> " " <> xs'
-    AVec a xs -> do xs' <- vec xs; return $ pp (a^.typ) <> " " <> xs'
+    AArr a xs -> agg a "[" "]" xs
+    ATup a xs -> agg a "{" "}" xs
+    AVec a xs -> agg a "<" ">" xs
   -- Like atomG, but omits the type annotation and can't do compound atoms
   opG = \case
     AVar _ x -> varG' x
@@ -791,9 +801,6 @@ anfG graph bbs = go where
         , F.fold fs'
         , l <: e'
         ]
-    -- ATuple a x t xs e -> do
-    --   xs' <- ops xs
-    --   ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
   goAFunc (AFunc a f axts t e)
     | f ∈ bbs = do
         let
@@ -911,6 +918,9 @@ instance PP (Atom a) where
   pp = \case
     AVar _ x -> show'' x
     AInt _ i w -> show'' i <> "i" <> show'' w
+    AArr _ xs -> "[" <> commaSep (map (indent . pp) xs) <> "]"
+    ATup _ xs -> "{" <> commaSep (map (indent . pp) xs) <> "}"
+    AVec _ xs -> "<" <> commaSep (map (indent . pp) xs) <> ">"
 
 instance PP (AFunc a) where
   pp (AFunc _ f xts t e) =
@@ -1077,6 +1087,7 @@ expP = do
         <*> expP <* symbol "in" <*> expP
     , symbol "case" >> Case loc <$> expP <*> braces (armP `P.sepBy` symbol ",")
     , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
+    , symbol "[" >> Array loc <$> listOf expP <* symbol "]"
     , symbol "{" >> Tuple loc <$> listOf expP <* symbol "}"
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
     , parens expP
