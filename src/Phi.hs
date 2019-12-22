@@ -450,10 +450,10 @@ infer = \case
           (te, anno -> a) -> raise a $ ExGotShape "integer" te
         t -> raise (anno e) $ ExGotShape "vector" t
       IndexA a n : ss -> case t of
-        Arr m t
+        Arr m t'
           | n < m -> do
-              (t', ss') <- goPath' t ss
-              return (t', IndexA (typ .==. Void .*. a) n : ss')
+              (t'', ss') <- goPath' t' ss
+              return (t'', IndexA (typ .==. Void .*. a) n : ss')
           | otherwise -> raise a $ OutOfBounds n t
         t -> raise a $ ExGotShape "array" t
       Index e : ss -> case t of
