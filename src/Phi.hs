@@ -86,6 +86,7 @@ data Arm a = Maybe Integer :=> Exp a deriving (THEUSUAL)
 data Exp a
   -- Primitives
   = Var a Var
+  | ExtVar a String
   | Int a Integer Width
   | Ann a (Exp a) Ty
   | Prim a Prim [Exp a]
@@ -136,6 +137,7 @@ makeLabelable "loc hasUB typ fvSet bvSet hasTail"
 anno :: Exp a -> a
 anno = \case
   Var a _ -> a
+  ExtVar a _ -> a
   Int a _ _ -> a
   Ann a _ _ -> a
   Prim a _ _ -> a
@@ -206,6 +208,7 @@ gen = modify' succ *> get
 foldVars :: Monoid m => (Var -> m) -> Exp a -> m
 foldVars f = \case
   Var _ x -> f x
+  ExtVar _ _ -> mempty
   Int _ _ _ -> mempty
   Ann _ e _ -> go e
   Prim _ _ es -> foldMap (go) es
@@ -247,6 +250,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
   goAnn a = hasUB .==. HasUB .*. a
   go σ = \case
     Var a x -> return $ Var a (σ ! x)
+    ExtVar a s -> return $ ExtVar a s
     Int a i w -> return $ Int a i w
     Ann a e ty -> Ann a <$> go σ e <*> pure ty
     Prim a p es -> Prim a p <$> mapM (go σ) es
@@ -289,6 +293,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
 
 data TCErr
   = NotInScope Var
+  | ExtNotInScope String
   | ExGotShape String Ty
   | ExGot Ty Ty
   | OutOfBounds Word Ty
@@ -297,6 +302,7 @@ data TCErr
 instance PP TCErr where
   pp = \case
     NotInScope x -> line $ "Variable not in scope: " <> show' x
+    ExtNotInScope s -> line $ "Extern variable not in scope: " <> fromString s
     ExGotShape shape ty ->
       line' $ "Expected " <> fromString shape <> " but got " <> pp ty
     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
@@ -305,25 +311,30 @@ instance PP TCErr where
 
 type TC =
   ExceptT (P.SourcePos, TCErr)
-  (Reader (Map Var Ty)) -- Typing environmnt
+  (Reader (Map Var Ty, Map String Ty)) -- Local + extern typing environmnts
 
-runTC' :: TC a -> Map Var Ty -> Either (P.SourcePos, TCErr) a
-runTC' m r = runExceptT m `runReader` r
+runTC' :: TC a -> Map Var Ty -> Map String Ty -> Either (P.SourcePos, TCErr) a
+runTC' m env extEnv = runExceptT m `runReader` (env, extEnv)
 
-runTC :: TC a -> Either String a
-runTC m = first pretty $ runTC' m M.empty where
+runTC :: TC a -> Map String Ty -> Either String a
+runTC m extEnv = first pretty $ runTC' m M.empty extEnv where
   pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err)
 
 withBindings :: [Var] -> [Ty] -> TC a -> TC a
-withBindings xs ts = local (M.union . M.fromList $ zip xs ts)
+withBindings xs ts = local (first $ (M.union . M.fromList $ zip xs ts))
 
 withBinding :: Var -> Ty -> TC a -> TC a
-withBinding x t = local (M.insert x t)
+withBinding x t = local (first $ M.insert x t)
 
 tcLookup :: UBAnn -> Var -> TC Ty
-tcLookup a x = (M.!? x) <$> ask >>= \case
+tcLookup a x = (M.!? x) . fst <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ NotInScope x
+
+extLookup :: UBAnn -> String -> TC Ty
+extLookup a s = (M.!? s) . snd <$> ask >>= \case
+  Just r -> return r
+  Nothing -> raise a $ ExtNotInScope s
 
 check :: Exp UBAnn -> Ty -> TC (Exp TyAnn)
 check exp ty = case exp of
@@ -367,9 +378,15 @@ var a x = do
   ty <- tcLookup a x
   return $ (ty, Var (typ .==. ty .*. a) x)
 
+extVar :: UBAnn -> String -> TC (Ty, Exp TyAnn)
+extVar a s = do
+  ty <- extLookup a s
+  return $ (ty, ExtVar (typ .==. ty .*. a) s)
+
 infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
 infer = \case
   Var a x -> var a x
+  ExtVar a s -> extVar a s
   Int a i w -> let t = PTy (I w) in return (t, Int (typ .==. t .*. a) i w)
   Ann _ e ty -> (ty, ) <$> check e ty
   Prim a p es -> do
@@ -493,6 +510,7 @@ infer = \case
 
 data Atom a
   = AVar a Var
+  | AExtVar a String
   | AInt a Integer Width
   | AArr a [Atom a]
   | ATup a [Atom a]
@@ -535,6 +553,7 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
   go :: Map Var (Atom TyAnn) -> Exp TyAnn -> State (Var, ANF TyAnn -> ANF TyAnn) (Atom TyAnn)
   go σ = \case
     Var a x -> return $ σ ! (a, x)
+    ExtVar a s -> return $ AExtVar a s
     Int a i w -> return $ AInt a i w
     Ann _ e _ -> go σ e -- We have type annotations already
     Prim a p es -> do
@@ -644,6 +663,7 @@ toTails = fmap (hasTail .==. HasTail .*.) . go where
 atomAnno :: Atom a -> a
 atomAnno = \case
   AVar a _ -> a
+  AExtVar a _ -> a
   AInt a _ _ -> a
   AArr a _ -> a
   ATup a _ -> a
@@ -688,6 +708,7 @@ annoFV = go where
   goAtom :: Atom TailAnn -> Atom FVAnn
   goAtom = \case
     AVar a x -> AVar (set (S.singleton x) a) x
+    AExtVar a s -> AExtVar (set S.empty a) s
     AInt a i w -> AInt (set S.empty a) i w
     AArr a (map goAtom -> xs) -> AArr (set (foldMap atomFVs xs) a) xs
     ATup a (map goAtom -> xs) -> ATup (set (foldMap atomFVs xs) a) xs
@@ -751,6 +772,7 @@ annoBV = go where
   goAtom :: Atom FVAnn -> Atom BVAnn
   goAtom = \case
     AVar a x -> AVar (set S.empty a) x
+    AExtVar a s -> AExtVar (set S.empty a) s
     AInt a i w -> AInt (set S.empty a) i w
     AArr a (map goAtom -> xs) -> AArr (set S.empty a) xs
     ATup a (map goAtom -> xs) -> ATup (set S.empty a) xs
@@ -825,8 +847,10 @@ graphOf = go Nothing where
     ACoerce _ _ _ _ e -> go callerOf e
     ACall ((^. loc) -> locOf) x _ (AVar _ f) actualsOf e ->
       add f (FnCall {locOf, isTail = False, callerOf, actualsOf}) (go callerOf e)
+    ACall _ _ _ _ _ e -> go callerOf e
     ATail ((^. loc) -> locOf) x _ (AVar _ f) actualsOf ->
       M.singleton f . S.singleton $ FnCall {locOf, isTail = True, callerOf, actualsOf}
+    ATail _ _ _ _ _ -> M.empty
     ACase ((^. loc) -> locOf) _ pes -> foldr goPes M.empty pes where
       goPes (x, (_, e)) r = add x fncall $ go (Just x) e `union` r
       fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
@@ -913,6 +937,7 @@ anfG graph bbs = go where
   agg a l r xs = do xs' <- mapM atomG xs; return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
   atomG = \case
     AVar a x -> do x' <- varG' x; return $ pp (a^.typ) <> " " <> x'
+    AExtVar a s -> return $ pp (a^.typ) <> " @" <> fromString s
     AInt _ i w -> return $ "i" <> show'' w <> " " <> show'' i
     AArr a xs -> agg a "[" "]" xs
     ATup a xs -> agg a "{" "}" xs
@@ -920,6 +945,7 @@ anfG graph bbs = go where
   -- Like atomG, but omits the type annotation and can't do compound atoms
   opG = \case
     AVar _ x -> varG' x
+    AExtVar _ s -> return $ "@" <> fromString s
     AInt _ i _ -> return $ show'' i
     a -> error $ "opG got compound atom: " ++ show a
   x .= doc = do x' <- varG' x; return . inst $ x' <> " = " <> doc
@@ -941,20 +967,19 @@ anfG graph bbs = go where
           y' <- atomG y
           ret e =<< x .= ("bitcast " <> y' <> " to " <> pp t2)
         (t2, t1) -> error $ "Unsupported coercion from " ++ show t1 ++ " to " ++ show t2
-    ACall a x t (AVar _ f) xs e -> do
-      known <- ask
-      let f' = if f ∉ bbs && f ∈ known then gvarG f else varG f
+    ACall a x t f xs e -> do
+      f' <- opG f
       xs' <- args xs
       ret e =<< x .= ("call " <> pp t <> " " <> f' <> xs')
-    ATail a x t (AVar _ f) xs
-      | f ∈ bbs -> return . inst $ "br label " <> varG f
-      | otherwise -> do
-          xs' <- args xs
-          f' <- varG' f
-          F.fold <$> sequence
-            [ x .= ("tail call " <> pp t <> " " <> f' <> xs')
-            , return . inst $ "ret " <> pp t <> " " <> varG x
-            ]
+    ATail a x t f xs -> case f of
+      AVar _ f | f ∈ bbs -> return . inst $ "br label " <> varG f
+      _ -> do
+        xs' <- args xs
+        f' <- opG f
+        F.fold <$> sequence
+          [ x .= ("tail call " <> pp t <> " " <> f' <> xs')
+          , return . inst $ "ret " <> pp t <> " " <> varG x
+          ]
     ACase a x lpes -> do
       case [r | r@(_, (_, (Nothing, _))) <- zip [0..] lpes] of
         [] -> do
@@ -1079,14 +1104,22 @@ anfG graph bbs = go where
           ]
         return mempty
 
-mainG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
-mainG graph bbs e =
+mainG :: Map String Ty -> CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
+mainG extEnv graph bbs e =
   let (body, globals) = runWriterT (anfG graph bbs e) `runReaderT` S.empty `evalState` 0 in
+  let extDecls = foldMap mkDecl (M.toList extEnv) in
   globals <> F.fold
-    [ line' $ "define i32 @main() {"
+    [ foldMap (line' . mkDecl) (M.toList extEnv)
+    , line' $ "define i32 @main() {"
     , body
     , line' "}"
     ]
+  where
+    mkDecl = \case
+      (f, FPtr ts t) ->
+        "declare " <> pp t <> " @" <> fromString f <>
+        "(" <> commaSep (map pp ts) <> ") nounwind"
+      (x, t) -> error $ "Unsupported extern type: " ++ runDoc (pp t)
 
 -- -------------------- Pretty printers --------------------
 
@@ -1123,6 +1156,7 @@ instance PP (Func a) where
 instance PP (Exp a) where
   pp = \case
     Var _ x -> show'' x
+    ExtVar _ s -> fromString s
     Int _ i w -> show'' i <> "i" <> show'' w
     Ann _ e ty -> pp e <> ": " <> pp ty
     Prim _ p es -> pp p <> "(" <> commaSep (map (indent . pp) es) <> ")"
@@ -1183,6 +1217,7 @@ instance PP (Step a) where
 instance PP (Atom a) where
   pp = \case
     AVar _ x -> show'' x
+    AExtVar _ s -> fromString s
     AInt _ i w -> show'' i <> "i" <> show'' w
     AArr _ xs -> "[" <> commaSep (map (indent . pp) xs) <> "]"
     ATup _ xs -> "{" <> commaSep (map (indent . pp) xs) <> "}"
@@ -1234,7 +1269,7 @@ instance PP (ANF a) where
 
 newtype PError = PError String deriving (Eq, Ord)
 
-type Parser = ParsecT PError String (State (Map String Word))
+type Parser = ParsecT PError String (State (Map String Word, Map String Ty))
 
 instance P.ShowErrorComponent PError where showErrorComponent (PError s) = s
 
@@ -1285,12 +1320,19 @@ word = do
 varP :: Parser Var
 varP = do
   x <- word
-  (M.!? x) <$> get >>= \case
+  (M.!? x) . fst <$> get >>= \case
     Nothing -> do
-      n <- fromIntegral . M.size <$> get
-      modify' (M.insert x n)
+      n <- fromIntegral . M.size . fst <$> get
+      modify' (first $ M.insert x n)
       return n
     Just n -> return n
+
+extVarP :: Parser String
+extVarP = do
+  x <- word
+  exts <- snd <$> get
+  guard $ x `M.member` exts
+  return x
 
 wordP :: Parser Word = read <$> lexeme (P.takeWhile1P (Just "digit") isDigit)
 
@@ -1356,8 +1398,14 @@ funcP =
 armP :: Parser (Arm ParseAnn)
 armP = (:=>) <$> (tryAll [Just <$> intP, symbol "_" $> Nothing]) <* symbol "=>" <*> expP
 
+externP :: Parser ()
+externP = do
+  xts <- concat <$> many (symbol "extern" >> braces (listOf ((,) <$> word <* symbol ":" <*> tyP)))
+  modify' $ second (M.union (M.fromList xts))
+
 expP' :: Bool -> Parser (Exp ParseAnn)
 expP' inGep = do
+  externP
   loc <- locP
   e <- tryAll
     [ Int loc <$> intP <*> (P.try (symbol "i" *> widthP) <|> pure 32)
@@ -1372,6 +1420,7 @@ expP' inGep = do
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
     , symbol "&" >> Gep loc <$> expP' True <*> pathP
     , parens expP
+    , ExtVar loc <$> extVarP
     , Var loc <$> varP
     ]
   e <- tryAll
@@ -1396,10 +1445,10 @@ expP' inGep = do
 expP :: Parser (Exp ParseAnn)
 expP = expP' False
 
-parse' :: String -> String -> (Either String (Exp ParseAnn), Map String Var)
+parse' :: String -> String -> (Either String (Exp ParseAnn), (Map String Var, Map String Ty))
 parse' fname s =
   first (first P.errorBundlePretty)
-    $ P.runParserT (expP <* P.eof) fname s `runState` M.empty
+    $ P.runParserT (expP <* P.eof) fname s `runState` (M.empty, M.empty)
 
 parse :: String -> Either String (Exp ParseAnn) = fst . parse' ""
 
@@ -1410,15 +1459,15 @@ parseFile f = fst . parse' f <$> readFile f
 
 compile :: String -> Either String String
 compile s = do
-  let (r, names) = parse' "" s
+  let (r, (names, extEnv)) = parse' "" s
   e <- ub <$> r
-  anf <- annoBV . annoFV . toTails . toANF <$> runTC (check e (PTy (I 32)))
+  anf <- annoBV . annoFV . toTails . toANF <$> runTC (check e (PTy (I 32))) extEnv
   let graph = graphOf anf
   let bvs = bvsOf anf
   let l = liveness bvs graph anf
   let bbs = inferBBs l
   first show $ checkBBs graph bbs
-  return . runDoc $ mainG graph bbs anf
+  return . runDoc $ mainG extEnv graph bbs anf
 
 compileFile :: FilePath -> IO (Either String String)
 compileFile f = compile <$> readFile f

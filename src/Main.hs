@@ -1,16 +1,19 @@
+module Main where
+
 import Phi
 import Data.Functor
 import Control.Applicative
 import System.Environment
+import qualified Data.Map as M
 
 print' :: (Functor f, Show (f ())) => f a -> IO ()
 print' x = print (x $> ())
 
 testTC :: String -> IO ()
-testTC s = either putStrLn print' $ (runTC . infer) =<< (ub <$> parse s)
+testTC s = either putStrLn print' $ (flip runTC M.empty . infer) =<< (ub <$> parse s)
 
 toANF' :: String -> Either String (ANF TyAnn)
-toANF' s = fmap (toANF . snd) . runTC . infer =<< (ub <$> parse s)
+toANF' s = fmap (toANF . snd) . flip runTC M.empty . infer =<< (ub <$> parse s)
 
 testANF :: String -> IO ()
 testANF s = either putStrLn print' (toANF' s)
@@ -199,6 +202,13 @@ tests = do
     , "    [1] = x[0]"
     , "  }"
     , "in 0"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "extern {"
+    , "  foo : fun (i32) -> *i8,"
+    , "  bar : fun (*i8) -> i32"
+    , "}"
+    , "bar(foo(0))"
     ]
 
 main = getArgs >>= \case
