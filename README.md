@@ -19,7 +19,8 @@ Todo:
 - [ ] Allocas
 - [x] Load/store/functional update/GEP
 - [x] Aggregates (structs, vectors, arrays)
-- [ ] Extern declarations
+- [x] Extern declarations
+- [ ] String literals?
 - [ ] Type aliases
 - [ ] (Recursive) type declarations
 - [ ] Infix parsing

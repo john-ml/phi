@@ -87,6 +87,7 @@ data Exp a
   -- Primitives
   = Var a Var
   | ExtVar a String
+  | Alloca a (Exp a)
   | Int a Integer Width
   | Ann a (Exp a) Ty
   | Prim a Prim [Exp a]
@@ -138,6 +139,7 @@ anno :: Exp a -> a
 anno = \case
   Var a _ -> a
   ExtVar a _ -> a
+  Alloca a _ -> a
   Int a _ _ -> a
   Ann a _ _ -> a
   Prim a _ _ -> a
@@ -209,6 +211,7 @@ foldVars :: Monoid m => (Var -> m) -> Exp a -> m
 foldVars f = \case
   Var _ x -> f x
   ExtVar _ _ -> mempty
+  Alloca _ e -> go e
   Int _ _ _ -> mempty
   Ann _ e _ -> go e
   Prim _ _ es -> foldMap (go) es
@@ -251,6 +254,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
   go σ = \case
     Var a x -> return $ Var a (σ ! x)
     ExtVar a s -> return $ ExtVar a s
+    Alloca a e -> Alloca a <$> go σ e
     Int a i w -> return $ Int a i w
     Ann a e ty -> Ann a <$> go σ e <*> pure ty
     Prim a p es -> Prim a p <$> mapM (go σ) es
@@ -387,6 +391,10 @@ infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
 infer = \case
   Var a x -> var a x
   ExtVar a s -> extVar a s
+  Alloca a e -> do
+    (t, e') <- infer e
+    let ty = PTy (Ptr t)
+    return (ty, Alloca (typ .==. ty .*. a) e')
   Int a i w -> let t = PTy (I w) in return (t, Int (typ .==. t .*. a) i w)
   Ann _ e ty -> (ty, ) <$> check e ty
   Prim a p es -> do
@@ -400,9 +408,13 @@ infer = \case
     (ty, e') <- withBinding x t (infer e)
     return (ty, Let (typ .==. ty .*. a) x t e1' e')
   Call a e es -> infer e >>= \case
-    (FPtr ts t, e') -> do
+    (FPtr ts t, e') | length ts == length es -> do
       es' <- zipWithM check es ts
       return (t, Call (typ .==. t .*. a) e' es')
+    (FPtr ts _, _) ->
+      raise a . Custom $
+        "Function expects " ++ show (length ts) ++
+        " arguments but got " ++ show (length es)
     (ty, _) -> raise a $ ExGotShape "function" ty
   Rec a funcs e -> do
     let fs = map (\ (Func _ f _ _ _) -> f) funcs
@@ -530,6 +542,7 @@ data AStep a
 data AFunc a = AFunc a Var [(a, Var, Ty)] Ty (ANF a) deriving (THEUSUAL)
 data ANF a
   = AHalt (Atom a)
+  | AAlloca a Var Ty (Atom a) (ANF a)
   | APrim a Var Ty Prim [Atom a] (ANF a)
   | ACoerce a Var Ty (Atom a) (ANF a)
   -- Control flow / name binding
@@ -554,6 +567,11 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
   go σ = \case
     Var a x -> return $ σ ! (a, x)
     ExtVar a s -> return $ AExtVar a s
+    Alloca a e -> do
+      e' <- go σ e
+      x <- gen'
+      push $ AAlloca a x (a^.typ) e'
+      return $ AVar a x
     Int a i w -> return $ AInt a i w
     Ann _ e _ -> go σ e -- We have type annotations already
     Prim a p es -> do
@@ -642,6 +660,7 @@ toTails :: ANF TyAnn -> ANF TailAnn
 toTails = fmap (hasTail .==. HasTail .*.) . go where
   go exp = case exp of
     AHalt _ -> exp
+    AAlloca a x t y e -> AAlloca a x t y (go e)
     APrim a x t p xs e -> APrim a x t p xs (go e)
     ACoerce a x t y e -> ACoerce a x t y (go e)
     ACall a x t f xs e
@@ -679,6 +698,7 @@ aStepAnno = \case
 aAnno :: ANF a -> a
 aAnno = \case
   AHalt x -> atomAnno x
+  AAlloca a _ _ _ _ -> a
   APrim a _ _ _ _ _  -> a
   ACoerce a _ _ _ _ -> a
   ACall a _ _ _ _ _ -> a
@@ -729,6 +749,8 @@ annoFV = go where
   go :: ANF TailAnn -> ANF FVAnn
   go = \case
     AHalt x -> AHalt (goAtom x)
+    AAlloca a x t (goAtom -> y) (go -> e) ->
+      AAlloca (set (S.delete x (fvs e) ∪ atomFVs y) a) x t y e
     APrim a x t p (map goAtom -> xs) (go -> e) ->
       APrim (set (S.delete x (fvs e) ∪ foldMap atomFVs xs) a) x t p xs e
     ACoerce a x t (goAtom -> y) (go -> e) ->
@@ -791,6 +813,8 @@ annoBV = go where
   go :: ANF FVAnn -> ANF BVAnn
   go = \case
     AHalt x -> AHalt (goAtom x)
+    AAlloca a x t (goAtom -> y) (go -> e) ->
+      AAlloca (set (S.insert x (bvs e)) a) x t y e
     APrim a x t p (map goAtom -> xs) (go -> e) ->
       APrim (set (S.insert x (bvs e)) a) x t p xs e
     ACoerce a x t (goAtom -> y) (go -> e) ->
@@ -817,6 +841,7 @@ bvsOf :: ANF BVAnn -> BVMap
 bvsOf = go M.empty where
   go m = \case
     AHalt _ -> m
+    AAlloca _ _ _ _ e -> go m e
     APrim _ _ _ _ _ e -> go m e
     ACoerce _ _ _ _ e -> go m e
     ACall _ _ _ _ _ e -> go m e
@@ -843,6 +868,7 @@ graphOf = go Nothing where
   goAFuncs = foldr (union . goAFunc) M.empty
   go callerOf = \case
     AHalt _ -> M.empty
+    AAlloca _ _ _ _ e -> go callerOf e
     APrim _ _ _ _ _ e -> go callerOf e
     ACoerce _ _ _ _ e -> go callerOf e
     ACall ((^. loc) -> locOf) x _ (AVar _ f) actualsOf e ->
@@ -871,6 +897,7 @@ initLive :: ANF BVAnn -> Liveness
 initLive = go where
   go = \case
     AHalt _ -> M.empty
+    AAlloca _ _ _ _ e -> go e
     APrim _ _ _ _ _ e -> go e
     ACoerce _ _ _ _ e -> go e
     ACall _ _ _ _ _ e -> go e
@@ -958,6 +985,12 @@ anfG graph bbs = go where
   go :: ANF BVAnn -> GenM Doc
   go = \case
     AHalt x -> inst . ("ret " <>) <$> atomG x
+    AAlloca a x pt y e -> do
+      y' <- atomG y
+      p <- gen
+      alloca <- x .= ("alloca " <> pp (atomAnno y ^. typ))
+      let store = inst $ "store " <> y' <> ", " <> pp pt <> " " <> varG x
+      ret e $ alloca <> store
     APrim a x t p xs e -> do
       xs' <- commaSep <$> mapM opG xs
       ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
@@ -1157,6 +1190,7 @@ instance PP (Exp a) where
   pp = \case
     Var _ x -> show'' x
     ExtVar _ s -> fromString s
+    Alloca _ e -> "ref " <> pp e
     Int _ i w -> show'' i <> "i" <> show'' w
     Ann _ e ty -> pp e <> ": " <> pp ty
     Prim _ p es -> pp p <> "(" <> commaSep (map (indent . pp) es) <> ")"
@@ -1231,6 +1265,7 @@ instance PP (AFunc a) where
 instance PP (ANF a) where
   pp = \case
     AHalt a -> line' $ "ret " <> pp a
+    AAlloca _ x t y e -> bind x t ("alloca " <> pp y) e
     APrim _ x t p ys e -> bind x t (pp p <> "(" <> commaSep (map pp ys) <> ")") e
     ACoerce _ x t y e -> bind x t ("coerce " <> pp y) e
     ACall _ x t f ys e -> bind x t (pp f <> "(" <> commaSep (map pp ys) <> ")") e
@@ -1419,6 +1454,7 @@ expP' inGep = do
     , symbol "{" >> Tuple loc <$> listOf expP <* symbol "}"
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
     , symbol "&" >> Gep loc <$> expP' True <*> pathP
+    , symbol "ref" >> Alloca loc <$> parens expP
     , parens expP
     , ExtVar loc <$> extVarP
     , Var loc <$> varP

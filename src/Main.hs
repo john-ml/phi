@@ -210,6 +210,22 @@ tests = do
     , "}"
     , "bar(foo(0))"
     ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "let xs: *{i32, *i32} = ref({3, ref(4)})"
+    , "in (xs[0].1)[0]"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(xs: *{i32, [2 x i32]}): i32 ="
+    , "  xs[0].1 <- [3, 4];"
+    , "  0"
+    , "in f(ref({2, [5, 6]}))"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(xs: *{i32, [2 x i32]}, i: i32): i32 ="
+    , "  xs[0].1 <- [3, i];"
+    , "  0"
+    , "in f(ref({2, [5, 6]}), 1)"
+    ]
 
 main = getArgs >>= \case
   ["test"] -> tests
