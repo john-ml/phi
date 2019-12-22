@@ -184,3 +184,17 @@ main = do
     , "  0"
     , "in 0"
     ]
+  either putStrLn putStrLn . compile $ "rec f(x: [2 x i32]): [2 x i32] = x with {[0] = 1, [1] = 2} in 0"
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(x: [2 x {i32, i32}]): {i32, i32} ="
+    , "  x[0] with {.1 = add(x[1].0, x[1].1)}"
+    , "in 0"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(x: [2 x {i32, i32}]): [2 x {i32, i32}] ="
+    , "  x with {"
+    , "    [0] = x[1] with {.1 = add(x[1].0, x[1].1)},"
+    , "    [1] = x[0]"
+    , "  }"
+    , "in 0"
+    ]

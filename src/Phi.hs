@@ -150,6 +150,7 @@ anno = \case
   Gep a _ _ -> a
   Load a _ _ -> a
   Store a _ _ _ _ -> a
+  Update a _ _ _ -> a
 
 raise a e = throwError (a ^. loc, e)
 
@@ -222,6 +223,7 @@ foldVars f = \case
   Gep _ e (Path ss) -> go e <> foldMap goStep ss
   Load _ e (Path ss) -> go e <> foldMap goStep ss
   Store _ dst (Path ss) src e -> go dst <> go src <> foldMap goStep ss <> go e
+  Update _ e (Path ss) e1 -> go e <> foldMap goStep ss <> go e1
   where
     go = foldVars f
     goStep = \case
@@ -274,6 +276,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
     Gep a e (Path ss) -> Gep a <$> go σ e <*> (Path <$> mapM goStep ss)
     Load a e (Path ss) -> Load a <$> go σ e <*> (Path <$> mapM goStep ss)
     Store a dst (Path ss) src e -> Store a <$> go σ dst <*> (Path <$> mapM goStep ss) <*> go σ src <*> go σ e
+    Update a e (Path ss) e1 -> Update a <$> go σ e <*> (Path <$> mapM goStep ss) <*> go σ e1
     where
       goStep = \case
         s@(Proj _ _) -> return s
@@ -440,6 +443,12 @@ infer = \case
         (ty, e') <- infer e
         return (ty, Store (typ .==. ty .*. a) dst' (Path ss'') src' e')
       (t, anno -> a) -> raise a $ ExGotShape "pointer" t
+  Update a e (Path ss) e1 -> infer e >>= \case
+    (ty, e') | (case ty of Tup _ -> True; Arr _ _ -> True; Vec _ _ -> True; _ -> False) -> do
+      (t, ss') <- goPath False ty ss
+      e1' <- check e1 t
+      return (ty, Update (typ .==. ty .*. a) e' (Path ss') e1')
+    (t, anno -> a) -> raise a $ ExGotShape "one of {tuple, array, vector}" t
   where
     okForGep a = \case
       ss@(Index _ : _) -> return ss
@@ -514,7 +523,7 @@ data ANF a
   | AGep a Var Ty (Atom a) (APath a) (ANF a) -- &e path (GEP)
   | ALoad a Var Ty (Atom a) (APath a) (ANF a) -- e path (GEP+load, extractvalue, extractelement)
   | AStore a (Atom a) (APath a) (Atom a) (ANF a) -- e path <- e; e (GEP+store)
-  | AUpdate a Var Ty (Atom a) (APath a) (ANF a) -- e with path = e (insertvalue, insertelement)
+  | AUpdate a Var Ty (Atom a) (APath a) (Atom a) (ANF a) -- e with path = e (insertvalue, insertelement)
   deriving (THEUSUAL)
 
 -- Get names from a function bundle
@@ -589,6 +598,13 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       ss' <- mapM goStep ss
       push $ AStore a dst' (APath ss') src'
       go σ e
+    Update a e (Path ss) e1 -> do
+      e' <- go σ e
+      ss' <- mapM goStep ss
+      e1' <- go σ e1
+      x <- gen'
+      push $ AUpdate a x (a^.typ) e' (APath ss') e1'
+      return $ AVar a x
     where
       goStep = \case
         Proj a n -> return $ AProj a n
@@ -617,6 +633,7 @@ toTails = fmap (hasTail .==. HasTail .*.) . go where
     AGep a x t y p e -> AGep a x t y p (go e)
     ALoad a x t y p e -> ALoad a x t y p (go e)
     AStore a d p s e -> AStore a d p s (go e)
+    AUpdate a x t y p z e -> AUpdate a x t y p z (go e)
   goAFunc (AFunc a f axts t e) = AFunc a f axts t (go e)
   checkTail x = \case
     AHalt (AVar _ x') | x == x' -> True
@@ -651,7 +668,7 @@ aAnno = \case
   AGep a _ _ _ _ _ -> a
   ALoad a _ _ _ _ _ -> a
   AStore a _ _ _ _ -> a
-  AUpdate a _ _ _ _ _  -> a
+  AUpdate a _ _ _ _ _ _ -> a
 
 fvs e = aAnno e ^. fvSet
 
@@ -709,6 +726,10 @@ annoFV = go where
       ALoad (set (S.delete x (foldMap stepFVs ss ∪ fvs e)) a) x t y (APath ss) e
     AStore a (goAtom -> d) (APath (map goStep -> ss)) (goAtom -> s) (go -> e) ->
       AStore (set (atomFVs d ∪ foldMap stepFVs ss ∪ atomFVs s ∪ fvs e) a) d (APath ss) s e
+    AUpdate a x t (goAtom -> y) (APath (map goStep -> ss)) (goAtom -> z) (go -> e) ->
+      AUpdate
+        (set (atomFVs y ∪ foldMap stepFVs ss ∪ atomFVs z ∪ S.delete x (fvs e)) a)
+        x t y (APath ss) z e
 
 -- -------------------- Annotate with variables bound under each subexpr --------------------
 
@@ -766,6 +787,8 @@ annoBV = go where
       ALoad (set (S.insert x (bvs e)) a) x t y (APath ss) e
     AStore a (goAtom -> d) (APath (map goStep -> ss)) (goAtom -> s) (go -> e) ->
       AStore (set (bvs e) a) d (APath ss) s e
+    AUpdate a x t (goAtom -> y) (APath (map goStep -> ss)) (goAtom -> z) (go -> e) ->
+      AUpdate (set (S.insert x (bvs e)) a) x t y (APath ss) z e
 
 -- Get names of bvs for each function/label
 bvsOf :: ANF BVAnn -> BVMap
@@ -782,6 +805,7 @@ bvsOf = go M.empty where
     AGep _ _ _ _ _ e -> go m e
     ALoad _ _ _ _ _ e -> go m e
     AStore _ _ _ _ e -> go m e
+    AUpdate _ _ _ _ _ _ e -> go m e
 
 -- -------------------- Call graph construction --------------------
 
@@ -811,6 +835,7 @@ graphOf = go Nothing where
     AGep _ _ _ _ _ e -> go callerOf e
     ALoad _ _ _ _ _ e -> go callerOf e
     AStore _ _ _ _ e -> go callerOf e
+    AUpdate _ _ _ _ _ _ e -> go callerOf e
 
 -- -------------------- Determine which functions should be BBs --------------------
 
@@ -832,6 +857,7 @@ initLive = go where
     AGep _ _ _ _ _ e -> go e
     ALoad _ _ _ _ _ e -> go e
     AStore _ _ _ _ e -> go e
+    AUpdate _ _ _ _ _ _ e -> go e
 
 liveness :: BVMap -> CallGraph BVAnn -> ANF BVAnn -> Liveness
 liveness bvs graph e = leastFlowAnno flow adjList (initLive e) where
@@ -986,6 +1012,7 @@ anfG graph bbs = go where
         y' <- atomG y
         let ss' = simplePath ss
         ret e =<< x .= ("extractvalue " <> y' <> ", " <> ss')
+      t -> error $ "Load got type " ++ show t
     AStore a d (APath ss) s e -> case atomAnno d ^. typ of
       PTy (Ptr t) -> do
         d' <- atomG d
@@ -999,6 +1026,18 @@ anfG graph bbs = go where
           , e'
           ]
       t -> error $ "Store got type " ++ show t
+    AUpdate a x t y (APath ss) z e -> case atomAnno y ^. typ of
+      Vec _ _ -> do
+        y' <- atomG y
+        ss' <- gepPath ss
+        z' <- atomG z
+        ret e =<< x .= ("insertelement " <> y' <> ", " <> z' <> ", " <> ss')
+      t | (case t of Arr _ _ -> True; Tup _ -> True; _ -> False) -> do
+        y' <- atomG y
+        let ss' = simplePath ss
+        z' <- atomG z
+        ret e =<< x .= ("insertvalue " <> y' <> ", " <> z' <> ", " <> ss')
+      t -> error $ "Update got type " ++ show t
     where
       simplePath ss = commaSep . for ss $ \case
         AProj _ n -> show'' n
@@ -1129,6 +1168,7 @@ instance PP (Exp a) where
       [ line' $ pp d <> pp p <> " <- " <> indent (pp s) <> ";"
       , line' $ pp e
       ]
+    Update _ e p e1 -> pp e <> " with " <> pp p <> " = " <> indent (pp e1)
 
 instance PP (Path a) where
   pp (Path ss) = foldMap pp ss
@@ -1325,7 +1365,7 @@ expP' inGep = do
     , symbol "let" >> Let loc
         <$> varP <* symbol ":" <*> tyP <* symbol "="
         <*> expP <* symbol "in" <*> expP
-    , symbol "case" >> Case loc <$> expP <*> braces (armP `P.sepBy` symbol ",")
+    , symbol "case" >> Case loc <$> expP <*> braces (listOf armP)
     , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
     , symbol "[" >> Array loc <$> listOf expP <* symbol "]"
     , symbol "{" >> Tuple loc <$> listOf expP <* symbol "}"
@@ -1334,7 +1374,7 @@ expP' inGep = do
     , parens expP
     , Var loc <$> varP
     ]
-  tryAll
+  e <- tryAll
     [ symbol ":" >> Ann loc e <$> tyP
     , symbol "as" >> Coerce loc e <$> tyP
     , Call loc e <$> tupleOf expP
@@ -1346,6 +1386,12 @@ expP' inGep = do
           ]
     , pure e
     ]
+  tryAll
+    [ symbol "with" >> updates loc e <$> braces (listOf ((,) <$> pathP <* symbol "=" <*> expP))
+    , pure e
+    ]
+  where
+    updates loc e pes = L.foldl' (\ e (p, e1) -> Update loc e p e1) e pes
 
 expP :: Parser (Exp ParseAnn)
 expP = expP' False

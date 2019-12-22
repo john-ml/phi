@@ -17,8 +17,8 @@ Todo:
 - [x] Parser, typechecker, and code generator for integer arithmetic + recursive functions
 - [ ] More aggressive basic block selection
 - [ ] Allocas
-- [ ] Load/store/functional update/GEP
-- [ ] Aggregates (structs, vectors, arrays)
+- [x] Load/store/functional update/GEP
+- [x] Aggregates (structs, vectors, arrays)
 - [ ] Extern declarations
 - [ ] Type aliases
 - [ ] (Recursive) type declarations
