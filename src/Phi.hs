@@ -1084,6 +1084,9 @@ anfG graph bbs = go where
           , e'
           ]
       t -> error $ "Store got type " ++ show t
+      -- TODO: generalize the store used here and in AAlloca. Specifically, if the value
+      -- being stored contains nonconst values, emit "undef" in initial store.
+      -- Then emit a proper gep + stre for each "undef hole"
     AUpdate a x t y (APath ss) z e -> case atomAnno y ^. typ of
       Vec _ _ -> do
         y' <- atomG y
