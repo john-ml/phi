@@ -16,10 +16,10 @@ functions to make it bearable for humans.
 Todo:
 - [x] Parser, typechecker, and code generator for integer arithmetic + recursive functions
 - [ ] More aggressive basic block selection
-- [ ] Pointers and mutation
+- [ ] Allocas
+- [ ] Load/store/functional update/GEP
 - [ ] Aggregates (structs, vectors, arrays)
 - [ ] Extern declarations
 - [ ] Type aliases
 - [ ] (Recursive) type declarations
 - [ ] Infix parsing
-

@@ -167,3 +167,6 @@ main = do
     $ "rec f(p: *{i32, [5 x <4 x *i32>]}, i: i32): **i32 = &p[0].1[i]<i>[2] in 0"
   either putStrLn putStrLn . compile
     $ "rec f(p: *{i32, [5 x <4 x *i32>]}, i: i32): **i32 = &p[0].1[i]<i> in 0"
+  either putStrLn putStrLn . compile
+    $ "rec f(a: [5 x [2 x i64]], i: i32): i64 = a[0][1] in 0"
+  either putStrLn putStrLn . compile $ "rec f(v: <10 x i16>, i: i32): i16 = add(v, v)<i> in 0"
