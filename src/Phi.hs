@@ -147,6 +147,7 @@ anno = \case
   Array a _ -> a
   Tuple a _ -> a
   Vector a _ -> a
+  Gep a _ _ -> a
 
 raise a e = throwError (a ^. loc, e)
 
@@ -210,12 +211,18 @@ foldVars f = \case
   Call _ e es -> foldVars f e <> foldMap (foldVars f) es
   Case _ e pes ->
     foldVars f e <> foldMap (\ (_ :=> e) -> foldVars f e) pes
-  Rec _ fs e -> foldMap foldFunc fs <> foldVars f e where
-    foldFunc (Func _ f' axts _ e) =
+  Rec _ fs e -> foldMap goFunc fs <> foldVars f e where
+    goFunc (Func _ f' axts _ e) =
       f f' <> foldMap (\ (_, x, _) -> f x) axts <> foldVars f e
   Array _ es -> foldMap (foldVars f) es
   Tuple _ es -> foldMap (foldVars f) es
   Vector _ es -> foldMap (foldVars f) es
+  Gep _ e (Path ss) -> foldVars f e <> foldMap goStep ss where
+    goStep = \case
+      Proj _ _ -> mempty
+      ElemA a _ -> mempty
+      Elem e -> foldVars f e
+      Index e -> foldVars f e
 
 -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
 maxUsed :: Exp a -> Var
@@ -258,6 +265,12 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
     Array a es -> Array a <$> mapM (go σ) es
     Tuple a es -> Tuple a <$> mapM (go σ) es
     Vector a es -> Vector a <$> mapM (go σ) es
+    Gep a e (Path ss) -> Gep a <$> go σ e <*> (Path <$> mapM goStep ss) where
+      goStep = \case
+        s@(Proj _ _) -> return s
+        s@(ElemA _ _) -> return s
+        Elem e -> Elem <$> go σ e
+        Index e -> Index <$> go σ e
   σ ! x = M.findWithDefault x x σ
 
 -- -------------------- Type checking --------------------
@@ -266,6 +279,7 @@ data TCErr
   = NotInScope Var
   | ExGotShape String Ty
   | ExGot Ty Ty
+  | OutOfBounds Word Ty
   | Custom String
 
 instance PP TCErr where
@@ -274,6 +288,7 @@ instance PP TCErr where
     ExGotShape shape ty ->
       line' $ "Expected " <> fromString shape <> " but got " <> pp ty
     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
+    OutOfBounds n ty -> line' $ "Index " <> show'' n <> " is out of bounds for type " <> pp ty
     Custom s -> line' $ fromString s
 
 type TC =
@@ -390,6 +405,43 @@ infer = \case
       let ty = Vec n t'
       return (ty, Vector (typ .==. ty .*. a) (e':es'))
     (t, _) -> raise a $ ExGotShape "primitive type" t
+  Gep a e (Path ss) -> infer e >>= \case
+    (t@(PTy (Ptr _)), e') -> do
+      (t', ss') <- goPath t ss
+      let ty = PTy (Ptr t')
+      return (ty, Gep (typ .==. ty .*. a) e' (Path ss'))
+    (t, anno -> a) -> raise a $ ExGotShape "pointer" t
+  where
+    goPath t = \case
+      [] -> return (t, [])
+      Proj a n : ss -> case t of
+        Tup ts
+          | n < L.genericLength ts -> do
+              (t', ss') <- goPath (ts `L.genericIndex` n) ss
+              return (t', Proj (typ .==. Void .*. a) n : ss')
+          | otherwise -> raise a $ OutOfBounds n t
+        t -> raise a $ ExGotShape "tuple" t
+      ElemA a n : ss -> case t of
+        Arr m t
+          | n < m -> do
+              (t', ss') <- goPath t ss
+              return (t', ElemA (typ .==. Void .*. a) n : ss')
+          | otherwise -> raise a $ OutOfBounds n t
+        t -> raise a $ ExGotShape "array" t
+      Elem e : ss -> case t of
+        Vec _ pt -> infer e >>= \case
+          (PTy (I _), e') -> do
+            (t', ss') <- goPath (PTy pt) ss
+            return (t', Elem e' : ss')
+          (te, anno -> a) -> raise a $ ExGotShape "integer" te
+        t -> raise (anno e) $ ExGotShape "vector" t
+      Index e : ss -> case t of
+        PTy (Ptr t) -> infer e >>= \case
+          (PTy (I _), e') -> do
+            (t', ss') <- goPath t ss
+            return (t', Index e' : ss')
+          (te, anno -> a) -> raise a $ ExGotShape "integer" te
+        t -> raise (anno e) $ ExGotShape "pointer" t
 
 -- -------------------- Conversion to ANF --------------------
 
@@ -405,8 +457,8 @@ newtype APath a = APath [AStep a] deriving (THEUSUAL)
 data AStep a
   = AProj a Word -- extractvalue struct: e.n, n const
   | AElemA a Word -- extractvalue array: e.[n], n const
-  | AElem (ANF a) -- extractelement: e<e>
-  | AIndex (ANF a) -- gep offset: e[e]
+  | AElem (Atom a) -- extractelement: e<e>
+  | AIndex (Atom a) -- gep offset: e[e]
   deriving (THEUSUAL)
 
 -- In addition to normal ANF-y things, case arms and continuations of Rec blocks are labelled
@@ -482,6 +534,18 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
     Array a es -> do es' <- mapM (go σ) es; return $ AArr a es'
     Tuple a es -> do es' <- mapM (go σ) es; return $ ATup a es'
     Vector a es -> do es' <- mapM (go σ) es; return $ AVec a es'
+    Gep a e (Path ss) -> do
+      e' <- go σ e
+      ss' <- mapM goStep ss
+      x <- gen'
+      push $ AGep a x (a^.typ) e' (APath ss')
+      return $ AVar a x
+      where
+        goStep = \case
+          Proj a n -> return $ AProj a n
+          ElemA a n -> return $ AElemA a n
+          Elem e -> AElem <$> go σ e
+          Index e -> AIndex <$> go σ e
     where
       σ ! (a, x) = M.findWithDefault (AVar a x) x σ
       gen' = modify' (first succ) >> fst <$> get
@@ -502,6 +566,7 @@ toTails = fmap (hasTail .==. HasTail .*.) . go where
       | otherwise -> ACall a x t f xs (go e)
     ACase a x xpes -> ACase a x (map (fmap (fmap go)) xpes)
     ARec a fs l e -> ARec a (map goAFunc fs) l (go e)
+    AGep a x t y p e -> AGep a x t y p (go e)
   goAFunc (AFunc a f axts t e) = AFunc a f axts t (go e)
   checkTail x = \case
     AHalt (AVar _ x') | x == x' -> True
@@ -516,6 +581,13 @@ atomAnno = \case
   AArr a _ -> a
   ATup a _ -> a
   AVec a _ -> a
+
+aStepAnno :: AStep a -> a
+aStepAnno = \case
+  AProj a _ -> a
+  AElemA a _ -> a
+  AElem x -> atomAnno x
+  AIndex x -> atomAnno x
 
 aAnno :: ANF a -> a
 aAnno = \case
@@ -553,10 +625,19 @@ annoFV = go where
     AArr a (map goAtom -> xs) -> AArr (set (foldMap atomFVs xs) a) xs
     ATup a (map goAtom -> xs) -> ATup (set (foldMap atomFVs xs) a) xs
     AVec a (map goAtom -> xs) -> AVec (set (foldMap atomFVs xs) a) xs
+  goAFuncs :: [AFunc TailAnn] -> [AFunc FVAnn]
   goAFuncs fs = map goAFunc fs where
     funcs = names fs
     goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
       AFunc (set (fvs e S.\\ S.fromList (map (\ (_, x, _) -> x) axts) S.\\ funcs) a) f axts t e
+  goStep :: AStep TailAnn -> AStep FVAnn
+  goStep = \case
+    AProj a n -> AProj (set S.empty a) n
+    AElemA a n -> AElemA (set S.empty a) n
+    AElem x -> AElem (goAtom x)
+    AIndex x -> AIndex (goAtom x)
+  stepFVs :: AStep FVAnn -> Set Var
+  stepFVs s = aStepAnno s ^. fvSet
   go :: ANF TailAnn -> ANF FVAnn
   go = \case
     AHalt x -> AHalt (goAtom x)
@@ -572,6 +653,8 @@ annoFV = go where
       ACase (set (atomFVs x ∪ foldMap (fvs . snd . snd) pes) a) x pes
     ARec a (goAFuncs -> fs) l (go -> e) ->
       ARec (set ((foldMap afuncFVs fs ∪ fvs e) S.\\ names fs) a) fs l e
+    AGep a x t (goAtom -> y) (APath (map goStep -> ss)) (go -> e) ->
+      AGep (set (S.delete x (foldMap stepFVs ss ∪ fvs e)) a) x t y (APath ss) e
 
 -- -------------------- Annotate with variables bound under each subexpr --------------------
 
@@ -597,10 +680,17 @@ annoBV = go where
     AArr a (map goAtom -> xs) -> AArr (set S.empty a) xs
     ATup a (map goAtom -> xs) -> ATup (set S.empty a) xs
     AVec a (map goAtom -> xs) -> AVec (set S.empty a) xs
+  goAFuncs :: [AFunc FVAnn] -> [AFunc BVAnn]
   goAFuncs fs = map goAFunc fs where
     funcs = names fs
     goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
       AFunc (set (bvs e ∪ S.fromList (map (\ (_, x, _) -> x) axts) ∪ funcs) a) f axts t e
+  goStep :: AStep FVAnn -> AStep BVAnn
+  goStep = \case
+    AProj a n -> AProj (set S.empty a) n
+    AElemA a n -> AElemA (set S.empty a) n
+    AElem x -> AElem (goAtom x)
+    AIndex x -> AIndex (goAtom x)
   go :: ANF FVAnn -> ANF BVAnn
   go = \case
     AHalt x -> AHalt (goAtom x)
@@ -616,6 +706,8 @@ annoBV = go where
       ACase (set (foldMap (bvs . snd . snd) pes) a) x pes
     ARec a (goAFuncs -> fs) l (go -> e) ->
       ARec (set (foldMap afuncBVs fs ∪ bvs e) a) fs l e
+    AGep a x t (goAtom -> y) (APath (map goStep -> ss)) (go -> e) ->
+      AGep (set (S.insert x (bvs e)) a) x t y (APath ss) e
 
 -- Get names of bvs for each function/label
 bvsOf :: ANF BVAnn -> BVMap
@@ -629,6 +721,7 @@ bvsOf = go M.empty where
     ACase _ _ xpes -> foldr (\ (x, (_, e)) m -> M.insert x (bvs e) (go m e)) m xpes
     ARec _ fs l e -> M.insert l (bvs e) $ foldr accAFunc m fs where
       accAFunc (AFunc a f axts t e) m = M.insert f (a^.bvSet) (go m e)
+    AGep _ _ _ _ _ e -> go m e
 
 -- -------------------- Call graph construction --------------------
 
@@ -655,6 +748,7 @@ graphOf = go Nothing where
       fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
     ARec ((^. loc) -> locOf) fs l e -> add l fncall $ goAFuncs fs `union` go (Just l) e where
       fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
+    AGep _ _ _ _ _ e -> go callerOf e
 
 -- -------------------- Determine which functions should be BBs --------------------
 
@@ -673,6 +767,7 @@ initLive = go where
     ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> M.insert x (fvs e) (go e)) xpes
     ARec _ fs l e -> foldr goAFunc (M.insert l (fvs e) (go e)) fs where
       goAFunc (AFunc a f _ _ e) m = M.insert f (a^.fvSet) (go e <> m)
+    AGep _ _ _ _ _ e -> go e
 
 liveness :: BVMap -> CallGraph BVAnn -> ANF BVAnn -> Liveness
 liveness bvs graph e = leastFlowAnno flow adjList (initLive e) where
@@ -801,6 +896,16 @@ anfG graph bbs = go where
         , F.fold fs'
         , l <: e'
         ]
+    AGep a x t y (APath ss) e -> case atomAnno y ^. typ of
+      (PTy (Ptr t)) -> do
+        y' <- atomG y
+        ss' <- fmap commaSep . forM ss $ \case
+          AProj _ n -> return $ "i32 " <> show'' n
+          AElemA _ n -> return $ "i32 " <> show'' n
+          AElem x -> atomG x
+          AIndex x -> atomG x
+        ret e =<< x .= ("getelementptr " <> pp t <> ", " <> y' <> ", " <> ss')
+      t -> error $ "GEP got type " ++ show t
   goAFunc (AFunc a f axts t e)
     | f ∈ bbs = do
         let
@@ -849,7 +954,7 @@ instance PP PTy where
     Float -> "float"
     Double -> "double"
     FP128 -> "FP128"
-    Ptr t -> "&" <> pp t
+    Ptr t -> pp t <> "*"
 
 instance PP Ty where
   pp = \case
@@ -1065,6 +1170,18 @@ primP = tryAll
 
 locP :: Parser ParseAnn = (\ pos -> loc .==. pos .*. emptyRecord) <$> P.getSourcePos
 
+stepP :: Parser (Step ParseAnn)
+stepP = do
+  loc <- locP
+  tryAll
+    [ symbol ".[" >> ElemA loc <$> wordP
+    , symbol "." >> Proj loc <$> wordP
+    , symbol "<" >> Elem <$> expP <* symbol ">"
+    , symbol "[" >> Index <$> expP <* symbol "]"
+    ]
+
+pathP :: Parser (Path ParseAnn) = Path <$> some stepP
+
 funcP :: Parser (Func ParseAnn)
 funcP =
   Func
@@ -1090,6 +1207,7 @@ expP = do
     , symbol "[" >> Array loc <$> listOf expP <* symbol "]"
     , symbol "{" >> Tuple loc <$> listOf expP <* symbol "}"
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
+    , symbol "&" >> Gep loc <$> expP <*> pathP
     , parens expP
     , Var loc <$> varP
     ]
