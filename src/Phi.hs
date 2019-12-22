@@ -149,6 +149,7 @@ anno = \case
   Vector a _ -> a
   Gep a _ _ -> a
   Load a _ _ -> a
+  Store a _ _ _ _ -> a
 
 raise a e = throwError (a ^. loc, e)
 
@@ -205,27 +206,29 @@ foldVars :: Monoid m => (Var -> m) -> Exp a -> m
 foldVars f = \case
   Var _ x -> f x
   Int _ _ _ -> mempty
-  Ann _ e _ -> foldVars f e
-  Prim _ _ es -> foldMap (foldVars f) es
-  Coerce _ e _ -> foldVars f e
-  Let _ x _ e1 e -> f x <> foldVars f e1 <> foldVars f e
-  Call _ e es -> foldVars f e <> foldMap (foldVars f) es
+  Ann _ e _ -> go e
+  Prim _ _ es -> foldMap (go) es
+  Coerce _ e _ -> go e
+  Let _ x _ e1 e -> f x <> go e1 <> go e
+  Call _ e es -> go e <> foldMap (go) es
   Case _ e pes ->
-    foldVars f e <> foldMap (\ (_ :=> e) -> foldVars f e) pes
-  Rec _ fs e -> foldMap goFunc fs <> foldVars f e where
+    go e <> foldMap (\ (_ :=> e) -> go e) pes
+  Rec _ fs e -> foldMap goFunc fs <> go e where
     goFunc (Func _ f' axts _ e) =
-      f f' <> foldMap (\ (_, x, _) -> f x) axts <> foldVars f e
-  Array _ es -> foldMap (foldVars f) es
-  Tuple _ es -> foldMap (foldVars f) es
-  Vector _ es -> foldMap (foldVars f) es
-  Gep _ e (Path ss) -> foldVars f e <> foldMap goStep ss
-  Load _ e (Path ss) -> foldVars f e <> foldMap goStep ss
+      f f' <> foldMap (\ (_, x, _) -> f x) axts <> go e
+  Array _ es -> foldMap (go) es
+  Tuple _ es -> foldMap (go) es
+  Vector _ es -> foldMap (go) es
+  Gep _ e (Path ss) -> go e <> foldMap goStep ss
+  Load _ e (Path ss) -> go e <> foldMap goStep ss
+  Store _ dst (Path ss) src e -> go dst <> go src <> foldMap goStep ss <> go e
   where
+    go = foldVars f
     goStep = \case
       Proj _ _ -> mempty
-      Elem e -> foldVars f e
+      Elem e -> go e
       IndexA _ _ -> mempty
-      Index e -> foldVars f e
+      Index e -> go e
 
 -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
 maxUsed :: Exp a -> Var
@@ -270,6 +273,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
     Vector a es -> Vector a <$> mapM (go σ) es
     Gep a e (Path ss) -> Gep a <$> go σ e <*> (Path <$> mapM goStep ss)
     Load a e (Path ss) -> Load a <$> go σ e <*> (Path <$> mapM goStep ss)
+    Store a dst (Path ss) src e -> Store a <$> go σ dst <*> (Path <$> mapM goStep ss) <*> go σ src <*> go σ e
     where
       goStep = \case
         s@(Proj _ _) -> return s
@@ -427,6 +431,15 @@ infer = \case
       (ty, ss') <- goPath False t ss
       return (ty, Load (typ .==. ty .*. a) e' (Path ss'))
     (t, anno -> a) -> raise a $ ExGotShape "one of {pointer, tuple, array, vector}" t
+  Store a dst (Path ss) src e -> do
+    ss' <- okForGep a ss
+    infer dst >>= \case
+      (t@(PTy (Ptr _)), dst') -> do
+        (t', ss'') <- goPath True t ss'
+        src' <- check src t'
+        (ty, e') <- infer e
+        return (ty, Store (typ .==. ty .*. a) dst' (Path ss'') src' e')
+      (t, anno -> a) -> raise a $ ExGotShape "pointer" t
   where
     okForGep a = \case
       ss@(Index _ : _) -> return ss
@@ -570,6 +583,12 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       x <- gen'
       push $ ALoad a x (a^.typ) e' (APath ss')
       return $ AVar a x
+    Store a dst (Path ss) src e -> do
+      src' <- go σ src
+      dst' <- go σ dst
+      ss' <- mapM goStep ss
+      push $ AStore a dst' (APath ss') src'
+      go σ e
     where
       goStep = \case
         Proj a n -> return $ AProj a n
@@ -597,6 +616,7 @@ toTails = fmap (hasTail .==. HasTail .*.) . go where
     ARec a fs l e -> ARec a (map goAFunc fs) l (go e)
     AGep a x t y p e -> AGep a x t y p (go e)
     ALoad a x t y p e -> ALoad a x t y p (go e)
+    AStore a d p s e -> AStore a d p s (go e)
   goAFunc (AFunc a f axts t e) = AFunc a f axts t (go e)
   checkTail x = \case
     AHalt (AVar _ x') | x == x' -> True
@@ -687,6 +707,8 @@ annoFV = go where
       AGep (set (S.delete x (foldMap stepFVs ss ∪ fvs e)) a) x t y (APath ss) e
     ALoad a x t (goAtom -> y) (APath (map goStep -> ss)) (go -> e) ->
       ALoad (set (S.delete x (foldMap stepFVs ss ∪ fvs e)) a) x t y (APath ss) e
+    AStore a (goAtom -> d) (APath (map goStep -> ss)) (goAtom -> s) (go -> e) ->
+      AStore (set (atomFVs d ∪ foldMap stepFVs ss ∪ atomFVs s ∪ fvs e) a) d (APath ss) s e
 
 -- -------------------- Annotate with variables bound under each subexpr --------------------
 
@@ -742,6 +764,8 @@ annoBV = go where
       AGep (set (S.insert x (bvs e)) a) x t y (APath ss) e
     ALoad a x t (goAtom -> y) (APath (map goStep -> ss)) (go -> e) ->
       ALoad (set (S.insert x (bvs e)) a) x t y (APath ss) e
+    AStore a (goAtom -> d) (APath (map goStep -> ss)) (goAtom -> s) (go -> e) ->
+      AStore (set (bvs e) a) d (APath ss) s e
 
 -- Get names of bvs for each function/label
 bvsOf :: ANF BVAnn -> BVMap
@@ -757,6 +781,7 @@ bvsOf = go M.empty where
       accAFunc (AFunc a f axts t e) m = M.insert f (a^.bvSet) (go m e)
     AGep _ _ _ _ _ e -> go m e
     ALoad _ _ _ _ _ e -> go m e
+    AStore _ _ _ _ e -> go m e
 
 -- -------------------- Call graph construction --------------------
 
@@ -785,6 +810,7 @@ graphOf = go Nothing where
       fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
     AGep _ _ _ _ _ e -> go callerOf e
     ALoad _ _ _ _ _ e -> go callerOf e
+    AStore _ _ _ _ e -> go callerOf e
 
 -- -------------------- Determine which functions should be BBs --------------------
 
@@ -805,6 +831,7 @@ initLive = go where
       goAFunc (AFunc a f _ _ e) m = M.insert f (a^.fvSet) (go e <> m)
     AGep _ _ _ _ _ e -> go e
     ALoad _ _ _ _ _ e -> go e
+    AStore _ _ _ _ e -> go e
 
 liveness :: BVMap -> CallGraph BVAnn -> ANF BVAnn -> Liveness
 liveness bvs graph e = leastFlowAnno flow adjList (initLive e) where
@@ -947,7 +974,7 @@ anfG graph bbs = go where
         load <- x .= ("load " <> pp t <> ", " <> pp (PTy (Ptr t)) <> " %ptr" <> show'' p)
         e' <- go e
         return $ F.fold
-          [ line' $ "%ptr" <> show'' p <> " = getelementptr " <> pp t' <> ", " <> y' <> ", " <> ss'
+          [ inst $ "%ptr" <> show'' p <> " = getelementptr " <> pp t' <> ", " <> y' <> ", " <> ss'
           , load
           , e'
           ]
@@ -959,6 +986,19 @@ anfG graph bbs = go where
         y' <- atomG y
         let ss' = simplePath ss
         ret e =<< x .= ("extractvalue " <> y' <> ", " <> ss')
+    AStore a d (APath ss) s e -> case atomAnno d ^. typ of
+      PTy (Ptr t) -> do
+        d' <- atomG d
+        ss' <- gepPath ss
+        s' <- atomG s
+        e' <- go e
+        p <- gen
+        return $ F.fold
+          [ inst $ "%ptr" <> show'' p <> " = getelementptr " <> pp t <> ", " <> d' <> ", " <> ss'
+          , inst $ "store " <> s' <> ", " <> pp (PTy (Ptr (atomAnno s ^. typ))) <> " %ptr" <> show'' p
+          , e'
+          ]
+      t -> error $ "Store got type " ++ show t
     where
       simplePath ss = commaSep . for ss $ \case
         AProj _ n -> show'' n
@@ -1085,6 +1125,10 @@ instance PP (Exp a) where
     Vector _ es -> "<" <> commaSep (map (indent . pp) es) <> ">"
     Gep _ e p -> "&" <> pp e <> pp p
     Load _ e p -> pp e <> pp p
+    Store _ d p s e -> F.fold
+      [ line' $ pp d <> pp p <> " <- " <> indent (pp s) <> ";"
+      , line' $ pp e
+      ]
 
 instance PP (Path a) where
   pp (Path ss) = foldMap pp ss
@@ -1294,7 +1338,12 @@ expP' inGep = do
     [ symbol ":" >> Ann loc e <$> tyP
     , symbol "as" >> Coerce loc e <$> tyP
     , Call loc e <$> tupleOf expP
-    , if inGep then empty else Load loc e <$> pathP
+    , if inGep then empty else do
+        p <- pathP
+        tryAll
+          [ symbol "<-" >> Store loc e p <$> expP <* symbol ";" <*> expP
+          , pure (Load loc e p)
+          ]
     , pure e
     ]
 

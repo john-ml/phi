@@ -174,3 +174,13 @@ main = do
     $ "rec f(a: [4 x {i32, [2 x [3 x i32]]}]): i32 = add(a[1].0, a[2].1[1][0]) in 0"
   either putStrLn putStrLn . compile
     $ "rec f(a: [4 x {i32, [2 x [3 x i32]]}]): i32 = add(a[1].0, a[2].1[1][3]) in 0"
+  either putStrLn putStrLn . compile
+    $ "rec f(p: **i32): i32 = (p[0])[0] in 0"
+  either putStrLn putStrLn . compile
+    $ "rec f(p: *i32): i32 = p[0] <- 1; 0 in 0"
+  either putStrLn putStrLn . compile $ unlines
+    [ "rec f(a: *[4 x {i32, [2 x [3 x i32]]}]): i32 ="
+    , "  a[0][3].0 <- add(a[0][1].0, a[0][2].1[1][2]);"
+    , "  0"
+    , "in 0"
+    ]
