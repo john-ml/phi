@@ -1080,7 +1080,7 @@ expP :: Parser (Exp ParseAnn)
 expP = do
   loc <- locP
   e <- tryAll
-    [ Int loc <$> intP <* symbol "i" <*> widthP
+    [ Int loc <$> intP <*> (symbol "i" *> widthP <|> pure 32)
     , Prim loc <$> primP <*> tupleOf expP
     , symbol "let" >> Let loc
         <$> varP <* symbol ":" <*> tyP <* symbol "="

@@ -123,21 +123,21 @@ main = do
     [ "let x: i32 = add(0i32, 0i32) in"
     , "rec even(n: i32): i32 ="
     , "  case n {"
-    , "    0 => add(x, 1i32),"
-    , "    1 => add(x, 0i32),"
-    , "    _ => odd(sub(n, 1i32))"
+    , "    0 => add(x, 1),"
+    , "    1 => add(x, 0),"
+    , "    _ => odd(sub(n, 1))"
     , "  }"
     , "and odd(n: i32): i32 ="
     , "  case n {"
-    , "    0 => 0i32,"
-    , "    1 => 1i32,"
-    , "    _ => even(sub(n, 1i32))"
+    , "    0 => 0,"
+    , "    1 => 1,"
+    , "    _ => even(sub(n, 1))"
     , "  }"
     , "in"
-    , "even(4i32)"
+    , "even(4)"
     ]
-  either putStrLn putStrLn . compile $ "rec f(_: <2 x i32>): i32 = f(<0i32, 1i32>) in 0i32"
-  either putStrLn putStrLn . compile $ "rec f(_: {i32, i32}): i32 = f({0i32, 1i32}) in 0i32"
+  either putStrLn putStrLn . compile $ "rec f(_: <2 x i32>): i32 = f(<0, 1>) in 0i32"
+  either putStrLn putStrLn . compile $ "rec f(_: {i32, i32}): i32 = f({0, 1}) in 0i32"
   either putStrLn putStrLn . compile $ unlines
     [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
     , "  f({0i64, {1i32, 2i64}, {<3i32, 4i32>, 5i32}})"
@@ -145,30 +145,19 @@ main = do
     ]
   either putStrLn putStrLn . compile $ unlines
     [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
-    , "  f({0i64, {1i32, 2i64}, {<3i32, 4i32>, 5i33}})"
-    , "in 0i32"
+    , "  f({0i64, {1, 2i64}, {<3, 4>, 5i33}})"
+    , "in 0"
     ]
   either putStrLn putStrLn . compile $ unlines
     [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
-    , "  f({0i64, {1i32, 2i64}, <3i32, 4i32>})"
-    , "in 0i32"
-    ]
-  either putStrLn putStrLn . compile $ unlines
-    [ "rec f(_: {i64, {i32, i64}, {<2 x i32>, i32}}): i32 ="
-    , "  let x: {i64, {i32, i64}, {<2 x i32>, i32}} = {0i64, {1i32, 2i64}, {<3i32, 4i32>, 5i32}} in"
+    , "  let x: {i64, {i32, i64}, {<2 x i32>, i32}} = {0i64, {1, 2i64}, {<3, 4>, 5}} in"
     , "  f(x)"
-    , "in 0i32"
+    , "in 0"
     ]
+  either putStrLn putStrLn . compile
+    $ "rec f(xs: <4 x i32>, ys: <4 x i32>): <4 x i32> = add(xs, ys) in 0"
+  either putStrLn putStrLn . compile
+    $ "rec f(xs: <4 x i32>, ys: <4 x i64>): <4 x i32> = add(xs, ys) in 0"
   either putStrLn putStrLn . compile $ unlines
-    [ "rec f(xs: <4 x i32>, ys: <4 x i32>): <4 x i32> = add(xs, ys) in"
-    , "0i32"
-    ]
-  either putStrLn putStrLn . compile $ unlines
-    [ "rec f(xs: <4 x i32>, ys: <4 x i64>): <4 x i32> = add(xs, ys) in"
-    , "0i32"
-    ]
-  either putStrLn putStrLn . compile $ unlines
-    [ "rec f(xs: <4 x i32>, ys: <5 x i32>): <4 x i32> = add(xs, ys) in"
-    , "0i32"
-    ]
-  either putStrLn putStrLn . compile $ "rec f(xs: [2 x i32]): [2 x i32] = [0i32, 1i32] in 0i32"
+    $ "rec f(xs: <4 x i32>, ys: <5 x i32>): <4 x i32> = add(xs, ys) in 0"
+  either putStrLn putStrLn . compile $ "rec f(xs: [2 x i32]): [2 x i32] = [0, 1] in 0"
