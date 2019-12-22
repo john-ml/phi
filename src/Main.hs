@@ -161,7 +161,9 @@ main = do
   either putStrLn putStrLn . compile
     $ "rec f(xs: <4 x i32>, ys: <5 x i32>): <4 x i32> = add(xs, ys) in 0"
   either putStrLn putStrLn . compile $ "rec f(xs: [2 x i32]): [2 x i32] = [0, 1] in 0"
-  either putStrLn putStrLn . compile $ "rec f(p: &{i32, <4 x i32>}, i: i32): &i32 = &p[0].1<i> in 0"
-  either putStrLn putStrLn . compile $ "rec f(p: &{i32, <4 x i32>}, i: i32): &i32 = &p[0].1 in 0"
   either putStrLn putStrLn . compile
-    $ "rec f(p: &{i32, [5 x <4 x i32>]}, i: i32): &i32 = &p[0].1.[3]<i> in 0"
+    $ "rec f(p: *{i32, [5 x <4 x i32>]}, i: i32): *i32 = &p[0].1[i]<i> in 0"
+  either putStrLn putStrLn . compile
+    $ "rec f(p: *{i32, [5 x <4 x *i32>]}, i: i32): **i32 = &p[0].1[i]<i>[2] in 0"
+  either putStrLn putStrLn . compile
+    $ "rec f(p: *{i32, [5 x <4 x *i32>]}, i: i32): **i32 = &p[0].1[i]<i> in 0"

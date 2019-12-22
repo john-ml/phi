@@ -70,10 +70,9 @@ data Ty
 newtype Path a = Path [Step a] deriving (THEUSUAL)
 data Step a
   = Proj a Word -- extractvalue struct: e.n, n const
-  | ElemA a Word -- extractvalue array: e.[n], n const
   | Elem (Exp a) -- extractelement: e<e>
-  | Index (Exp a) -- gep offset: e[e]
-  -- TODO: can only have one Index per GEP, and it must be the first one...
+  | IndexA a Word -- extractvalue array: e.[n], n const
+  | Index (Exp a) -- array offset: e[e]
   deriving (THEUSUAL)
 
 type Var = Word
@@ -221,8 +220,8 @@ foldVars f = \case
   Gep _ e (Path ss) -> foldVars f e <> foldMap goStep ss where
     goStep = \case
       Proj _ _ -> mempty
-      ElemA a _ -> mempty
       Elem e -> foldVars f e
+      IndexA a _ -> mempty
       Index e -> foldVars f e
 
 -- Smallest variable v such that {v + 1, v + 2, ..} are all unused
@@ -269,7 +268,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
     Gep a e (Path ss) -> Gep a <$> go σ e <*> (Path <$> mapM goStep ss) where
       goStep = \case
         s@(Proj _ _) -> return s
-        s@(ElemA _ _) -> return s
+        s@(IndexA _ _) -> return s
         Elem e -> Elem <$> go σ e
         Index e -> Index <$> go σ e
   σ ! x = M.findWithDefault x x σ
@@ -406,43 +405,52 @@ infer = \case
       let ty = Vec n t'
       return (ty, Vector (typ .==. ty .*. a) (e':es'))
     (t, _) -> raise a $ ExGotShape "primitive type" t
-  Gep a e (Path ss) -> infer e >>= \case
-    (t@(PTy (Ptr _)), e') -> do
-      (t', ss') <- goPath t ss
-      let ty = PTy (Ptr t')
-      return (ty, Gep (typ .==. ty .*. a) e' (Path ss'))
-    (t, anno -> a) -> raise a $ ExGotShape "pointer" t
+  Gep a e (Path ss) -> case ss of
+    Index _ : _ -> go ss
+    IndexA a n : ss' -> go (Index (Int a (fromIntegral n) 32) : ss')
+    _ -> raise a $ Custom "GEP must start with array index"
+    where
+      go ss = infer e >>= \case
+        (t@(PTy (Ptr _)), e') -> do
+          (t', ss') <- goPath True t ss
+          let ty = PTy (Ptr t')
+          return (ty, Gep (typ .==. ty .*. a) e' (Path ss'))
+        (t, anno -> a) -> raise a $ ExGotShape "pointer" t
   where
-    goPath t = \case
+    goPath' = goPath False
+    goPath lax t = \case
       [] -> return (t, [])
       Proj a n : ss -> case t of
         Tup ts
           | n < L.genericLength ts -> do
-              (t', ss') <- goPath (ts `L.genericIndex` n) ss
+              (t', ss') <- goPath' (ts `L.genericIndex` n) ss
               return (t', Proj (typ .==. Void .*. a) n : ss')
           | otherwise -> raise a $ OutOfBounds n t
         t -> raise a $ ExGotShape "tuple" t
-      ElemA a n : ss -> case t of
-        Arr m t
-          | n < m -> do
-              (t', ss') <- goPath t ss
-              return (t', ElemA (typ .==. Void .*. a) n : ss')
-          | otherwise -> raise a $ OutOfBounds n t
-        t -> raise a $ ExGotShape "array" t
       Elem e : ss -> case t of
         Vec _ pt -> infer e >>= \case
           (PTy (I _), e') -> do
-            (t', ss') <- goPath (PTy pt) ss
+            (t', ss') <- goPath' (PTy pt) ss
             return (t', Elem e' : ss')
           (te, anno -> a) -> raise a $ ExGotShape "integer" te
         t -> raise (anno e) $ ExGotShape "vector" t
+      IndexA a n : ss -> case t of
+        Arr m t
+          | n < m -> do
+              (t', ss') <- goPath' t ss
+              return (t', IndexA (typ .==. Void .*. a) n : ss')
+          | otherwise -> raise a $ OutOfBounds n t
+        t -> raise a $ ExGotShape "array" t
       Index e : ss -> case t of
-        PTy (Ptr t) -> infer e >>= \case
-          (PTy (I _), e') -> do
-            (t', ss') <- goPath t ss
-            return (t', Index e' : ss')
-          (te, anno -> a) -> raise a $ ExGotShape "integer" te
-        t -> raise (anno e) $ ExGotShape "pointer" t
+        PTy (Ptr t) | lax -> go t
+        Arr _ t -> go t
+        t -> raise (anno e) $ ExGotShape ((if lax then "pointer or" else "") <> "array") t
+        where
+          go t = infer e >>= \case
+            (PTy (I _), e') -> do
+              (t', ss') <- goPath' t ss
+              return (t', Index e' : ss')
+            (te, anno -> a) -> raise a $ ExGotShape "integer" te
 
 -- -------------------- Conversion to ANF --------------------
 
@@ -457,8 +465,8 @@ data Atom a
 newtype APath a = APath [AStep a] deriving (THEUSUAL)
 data AStep a
   = AProj a Word -- extractvalue struct: e.n, n const
-  | AElemA a Word -- extractvalue array: e.[n], n const
   | AElem (Atom a) -- extractelement: e<e>
+  | AIndexA a Word -- extractvalue array: e.[n], n const
   | AIndex (Atom a) -- gep offset: e[e]
   deriving (THEUSUAL)
 
@@ -544,8 +552,8 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       where
         goStep = \case
           Proj a n -> return $ AProj a n
-          ElemA a n -> return $ AElemA a n
           Elem e -> AElem <$> go σ e
+          IndexA a n -> return $ AIndexA a n
           Index e -> AIndex <$> go σ e
     where
       σ ! (a, x) = M.findWithDefault (AVar a x) x σ
@@ -586,8 +594,8 @@ atomAnno = \case
 aStepAnno :: AStep a -> a
 aStepAnno = \case
   AProj a _ -> a
-  AElemA a _ -> a
   AElem x -> atomAnno x
+  AIndexA a _ -> a
   AIndex x -> atomAnno x
 
 aAnno :: ANF a -> a
@@ -634,8 +642,8 @@ annoFV = go where
   goStep :: AStep TailAnn -> AStep FVAnn
   goStep = \case
     AProj a n -> AProj (set S.empty a) n
-    AElemA a n -> AElemA (set S.empty a) n
     AElem x -> AElem (goAtom x)
+    AIndexA a n -> AIndexA (set S.empty a) n
     AIndex x -> AIndex (goAtom x)
   stepFVs :: AStep FVAnn -> Set Var
   stepFVs s = aStepAnno s ^. fvSet
@@ -689,8 +697,8 @@ annoBV = go where
   goStep :: AStep FVAnn -> AStep BVAnn
   goStep = \case
     AProj a n -> AProj (set S.empty a) n
-    AElemA a n -> AElemA (set S.empty a) n
     AElem x -> AElem (goAtom x)
+    AIndexA a n -> AIndexA (set S.empty a) n
     AIndex x -> AIndex (goAtom x)
   go :: ANF FVAnn -> ANF BVAnn
   go = \case
@@ -902,8 +910,8 @@ anfG graph bbs = go where
         y' <- atomG y
         ss' <- fmap commaSep . forM ss $ \case
           AProj _ n -> return $ "i32 " <> show'' n
-          AElemA _ n -> return $ "i32 " <> show'' n
           AElem x -> atomG x
+          AIndexA _ n -> return $ "i32 " <> show'' n
           AIndex x -> atomG x
         ret e =<< x .= ("getelementptr " <> pp t <> ", " <> y' <> ", " <> ss')
       t -> error $ "GEP got type " ++ show t
@@ -1145,7 +1153,7 @@ ptyP = tryAll
   , symbol "double" $> Double
   , symbol "fp128" $> FP128
   , parens ptyP
-  , symbol "&" >> Ptr <$> tyP
+  , symbol "*" >> Ptr <$> tyP
   ]
 
 tyP :: Parser Ty
@@ -1175,10 +1183,12 @@ stepP :: Parser (Step ParseAnn)
 stepP = do
   loc <- locP
   tryAll
-    [ symbol ".[" >> ElemA loc <$> wordP <* symbol "]"
-    , symbol "." >> Proj loc <$> wordP
+    [ symbol "." >> Proj loc <$> wordP
     , symbol "<" >> Elem <$> expP <* symbol ">"
-    , symbol "[" >> Index <$> expP <* symbol "]"
+    , symbol "[" >> tryAll
+        [ IndexA loc <$> wordP
+        , Index <$> expP
+        ] <* symbol "]"
     ]
 
 pathP :: Parser (Path ParseAnn) = Path <$> some stepP
