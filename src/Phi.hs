@@ -73,6 +73,7 @@ data Step a
   | ElemA a Word -- extractvalue array: e.[n], n const
   | Elem (Exp a) -- extractelement: e<e>
   | Index (Exp a) -- gep offset: e[e]
+  -- TODO: can only have one Index per GEP, and it must be the first one...
   deriving (THEUSUAL)
 
 type Var = Word
@@ -1174,7 +1175,7 @@ stepP :: Parser (Step ParseAnn)
 stepP = do
   loc <- locP
   tryAll
-    [ symbol ".[" >> ElemA loc <$> wordP
+    [ symbol ".[" >> ElemA loc <$> wordP <* symbol "]"
     , symbol "." >> Proj loc <$> wordP
     , symbol "<" >> Elem <$> expP <* symbol ">"
     , symbol "[" >> Index <$> expP <* symbol "]"
@@ -1197,7 +1198,7 @@ expP :: Parser (Exp ParseAnn)
 expP = do
   loc <- locP
   e <- tryAll
-    [ Int loc <$> intP <*> (symbol "i" *> widthP <|> pure 32)
+    [ Int loc <$> intP <*> (P.try (symbol "i" *> widthP) <|> pure 32)
     , Prim loc <$> primP <*> tupleOf expP
     , symbol "let" >> Let loc
         <$> varP <* symbol ":" <*> tyP <* symbol "="
