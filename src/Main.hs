@@ -1,6 +1,7 @@
 import Phi
 import Data.Functor
 import Control.Applicative
+import System.Environment
 
 print' :: (Functor f, Show (f ())) => f a -> IO ()
 print' x = print (x $> ())
@@ -14,7 +15,8 @@ toANF' s = fmap (toANF . snd) . runTC . infer =<< (ub <$> parse s)
 testANF :: String -> IO ()
 testANF s = either putStrLn print' (toANF' s)
 
-main = do
+tests :: IO ()
+tests = do
   either putStrLn print' $ parse "3i32"
   either putStrLn print' $ parse "let x: i32 = 3i32 in 4i32"
   testTC "let x: i32 = 3i32 in mul(2i32, 3i32)"
@@ -198,3 +200,11 @@ main = do
     , "  }"
     , "in 0"
     ]
+
+main = getArgs >>= \case
+  ["test"] -> tests
+  [phiIn] -> either putStrLn putStrLn =<< compileFile phiIn
+  _ -> do
+    putStrLn "Usage:"
+    putStrLn "  phi test (run some tests)"
+    putStrLn "  phi in.φ (compile in.φ to llvm)"
