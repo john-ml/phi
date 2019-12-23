@@ -226,6 +226,11 @@ tests = do
     , "  0"
     , "in f(ref({2, {[5, 6], 7}}), 1)"
     ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "let xs: *{i32, *{i32, *{i32, *{i32, *{i32, i32}}}}} ="
+    , "  ref({3, ref({4, ref({5, ref({6, ref({7, 8})})})})})"
+    , "in ((((xs[0].1)[0].1)[0].1)[0].1)[0].0"
+    ]
 
 main = getArgs >>= \case
   ["test"] -> tests
