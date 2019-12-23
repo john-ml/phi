@@ -1347,7 +1347,7 @@ tupleOf = parens . listOf
 -- -------------------- Parsing --------------------
 
 keywords :: [String]
-keywords = ["rec", "and", "in", "case", "as"]
+keywords = ["rec", "and", "in", "case", "as", "extern", "with"]
 
 word :: Parser String
 word = do
