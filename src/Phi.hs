@@ -225,18 +225,18 @@ foldVars f = \case
   Alloca _ e -> go e
   Int _ _ _ -> mempty
   Ann _ e _ -> go e
-  Prim _ _ es -> foldMap (go) es
+  Prim _ _ es -> foldMap go es
   Coerce _ e _ -> go e
   Let _ x _ e1 e -> f x <> go e1 <> go e
-  Call _ e es -> go e <> foldMap (go) es
+  Call _ e es -> go e <> foldMap go es
   Case _ e pes ->
     go e <> foldMap (\ (_ :=> e) -> go e) pes
   Rec _ fs e -> foldMap goFunc fs <> go e where
     goFunc (Func _ f' axts _ e) =
       f f' <> foldMap (\ (_, x, _) -> f x) axts <> go e
-  Array _ es -> foldMap (go) es
-  Tuple _ es -> foldMap (go) es
-  Vector _ es -> foldMap (go) es
+  Array _ es -> foldMap go es
+  Tuple _ es -> foldMap go es
+  Vector _ es -> foldMap go es
   Gep _ e (Path ss) -> go e <> foldMap goStep ss
   Load _ e (Path ss) -> go e <> foldMap goStep ss
   Store _ dst (Path ss) src e -> go dst <> go src <> foldMap goStep ss <> go e
@@ -294,7 +294,8 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
     Vector a es -> Vector a <$> mapM (go σ) es
     Gep a e (Path ss) -> Gep a <$> go σ e <*> (Path <$> mapM goStep ss)
     Load a e (Path ss) -> Load a <$> go σ e <*> (Path <$> mapM goStep ss)
-    Store a dst (Path ss) src e -> Store a <$> go σ dst <*> (Path <$> mapM goStep ss) <*> go σ src <*> go σ e
+    Store a dst (Path ss) src e ->
+      Store a <$> go σ dst <*> (Path <$> mapM goStep ss) <*> go σ src <*> go σ e
     Update a e (Path ss) e1 -> Update a <$> go σ e <*> (Path <$> mapM goStep ss) <*> go σ e1
     where
       goStep = \case
@@ -336,7 +337,7 @@ runTC m extEnv = first pretty $ runTC' m M.empty extEnv where
   pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err)
 
 withBindings :: [Var] -> [Ty] -> TC a -> TC a
-withBindings xs ts = local (first $ (M.union . M.fromList $ zip xs ts))
+withBindings xs ts = local (first (M.union . M.fromList $ zip xs ts))
 
 withBinding :: Var -> Ty -> TC a -> TC a
 withBinding x t = local (first $ M.insert x t)
@@ -368,7 +369,7 @@ checkNumOp a = \case
   [] -> raise a . Custom $ "Expected at least one argument"
   (e:es) -> do
     (t, e') <- infer e
-    when (not (ok t)) . raise a $ ExGotShape "numeric type or <_ x numeric type>" t
+    unless (ok t) . raise a $ ExGotShape "numeric type or <_ x numeric type>" t
     es' <- mapM (`check` t) es
     return (t, e':es')
   where
@@ -404,12 +405,12 @@ checkPrim a es = \case
 var :: UBAnn -> Var -> TC (Ty, Exp TyAnn)
 var a x = do
   ty <- tcLookup a x
-  return $ (ty, Var (typ .==. ty .*. a) x)
+  return (ty, Var (typ .==. ty .*. a) x)
 
 extVar :: UBAnn -> String -> TC (Ty, Exp TyAnn)
 extVar a s = do
   ty <- extLookup a s
-  return $ (ty, ExtVar (typ .==. ty .*. a) s)
+  return (ty, ExtVar (typ .==. ty .*. a) s)
 
 infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
 infer = \case
@@ -589,7 +590,7 @@ toANF :: Exp TyAnn -> ANF TyAnn
 toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt x) where
   go :: Map Var (Atom TyAnn) -> Exp TyAnn -> State (Var, ANF TyAnn -> ANF TyAnn) (Atom TyAnn)
   go σ = \case
-    Var a x -> return $ σ ! (a, x)
+    Var a x -> return $ M.findWithDefault (AVar a x) x σ
     ExtVar a s -> return $ AExtVar a s
     Alloca a e -> do
       e' <- go σ e
@@ -621,9 +622,7 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       e' <- go σ e
       k <- get'
       pes' <- forM pes $ \ (p :=> e1) -> do
-        put' id
-        e1' <- go σ e1
-        k <- get'
+        (e1', k) <- goReset σ e1
         l <- gen'
         return (l, (p, k (AHalt e1')))
       put' $ const (k (ACase a e' pes'))
@@ -631,9 +630,7 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
     Rec a helpers e -> do
       k <- get'
       helpers' <- forM helpers $ \ (Func a f axts t e1) -> do
-        put' id
-        e1' <- go σ e1
-        k <- get'
+        (e1', k) <- goReset σ e1
         return (AFunc a f axts t (k (AHalt e1')))
       l <- gen'
       put' $ k . ARec a helpers' l
@@ -642,8 +639,7 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
     Tuple a es -> do es' <- mapM (go σ) es; return $ ATup a es'
     Vector a es -> do es' <- mapM (go σ) es; return $ AVec a es'
     Gep a e (Path ss) -> do
-      e' <- go σ e
-      ss' <- mapM goStep ss
+      (e', ss') <- goSteps e ss
       x <- gen'
       push $ AGep a x (a^.typ) e' (APath ss')
       return $ AVar a x
@@ -655,8 +651,7 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       return $ AVar a x
     Store a dst (Path ss) src e -> do
       src' <- go σ src
-      dst' <- go σ dst
-      ss' <- mapM goStep ss
+      (dst', ss') <- goSteps dst ss
       push $ AStore a dst' (APath ss') src'
       go σ e
     Update a e (Path ss) e1 -> do
@@ -667,12 +662,13 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       push $ AUpdate a x (a^.typ) e' (APath ss') e1'
       return $ AVar a x
     where
+      goReset σ e = put' id *> liftA2 (,) (go σ e) get'
+      goSteps e ss = liftA2 (,) (go σ e) (mapM goStep ss)
       goStep = \case
         Proj a n -> return $ AProj a n
         Elem e -> AElem <$> go σ e
         IndexA a n -> return $ AIndexA a n
         Index e -> AIndex <$> go σ e
-      σ ! (a, x) = M.findWithDefault (AVar a x) x σ
       gen' = modify' (first succ) >> fst <$> get
       push f = modify' (second (. f))
       put' = modify' . second . const
@@ -896,16 +892,16 @@ graphOf = go Nothing where
     APrim _ _ _ _ _ e -> go callerOf e
     ACoerce _ _ _ _ e -> go callerOf e
     ACall ((^. loc) -> locOf) x _ (AVar _ f) actualsOf e ->
-      add f (FnCall {locOf, isTail = False, callerOf, actualsOf}) (go callerOf e)
+      add f FnCall{locOf, isTail = False, callerOf, actualsOf} (go callerOf e)
     ACall _ _ _ _ _ e -> go callerOf e
     ATail ((^. loc) -> locOf) x _ (AVar _ f) actualsOf ->
-      M.singleton f . S.singleton $ FnCall {locOf, isTail = True, callerOf, actualsOf}
+      M.singleton f $ S.singleton FnCall{locOf, isTail = True, callerOf, actualsOf}
     ATail _ _ _ _ _ -> M.empty
     ACase ((^. loc) -> locOf) _ pes -> foldr goPes M.empty pes where
       goPes (x, (_, e)) r = add x fncall $ go (Just x) e `union` r
-      fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
+      fncall = FnCall{locOf, isTail = True, callerOf, actualsOf = []}
     ARec ((^. loc) -> locOf) fs l e -> add l fncall $ goAFuncs fs `union` go (Just l) e where
-      fncall = FnCall {locOf, isTail = True, callerOf, actualsOf = []}
+      fncall = FnCall{locOf, isTail = True, callerOf, actualsOf = []}
     AGep _ _ _ _ _ e -> go callerOf e
     ALoad _ _ _ _ _ e -> go callerOf e
     AStore _ _ _ _ e -> go callerOf e
@@ -940,7 +936,7 @@ liveness bvs graph e = leastFlowAnno flow adjList (initLive e) where
   adjList =
     [ (x, ys)
     | (x, callers) <- M.toList graph
-    , let ys = [y | FnCall {callerOf = Just y} <- S.toList callers]
+    , let ys = [y | FnCall{callerOf = Just y} <- S.toList callers]
     ]
 
 -- Determine which functions should be BBs based on liveness information
@@ -949,7 +945,7 @@ inferBBs = M.keysSet . M.filter (not . S.null)
 
 -- -------------------- Check that BBs only called in tail position --------------------
 
-data BBErr = NotTail P.SourcePos
+newtype BBErr = NotTail P.SourcePos
 
 instance Show BBErr where
   show (NotTail pos) = P.sourcePosPretty pos ++ ": " ++ msg where
@@ -958,8 +954,8 @@ instance Show BBErr where
 checkBBs :: CallGraph BVAnn -> BBs -> Either BBErr ()
 checkBBs graph bbs =
   forM_ bbs $ \ x ->
-    forM_ (graph !! x) $ \ (FnCall {isTail, locOf}) ->
-      when (not isTail) . throwError $ NotTail locOf
+    forM_ (graph !! x) $ \ FnCall{isTail, locOf} ->
+      unless isTail . throwError $ NotTail locOf
 
 -- -------------------- Code generation --------------------
 
@@ -1006,6 +1002,37 @@ anfG graph bbs = go where
     , body
     ]
   ret e line = (line <>) <$> go e
+  storeG :: Atom BVAnn -> Ty -> Doc -> GenM Doc
+  storeG s ty p = do
+    (s', w) <- runWriterT (go [] s)
+    return $ inst ("store " <> s' <> ", " <> pty) <> w
+    where
+      pty = pp (PTy (Ptr ty)) <> " " <> p
+      go ss s = case s of
+        AVar a _ -> case ss of
+          [] -> base s
+          _ -> do
+            fillHole ss s
+            return $ pp (a^.typ) <> " undef"
+        AExtVar _ _ -> base s
+        AInt _ _ _ -> base s
+        AArr a xs -> agg' a "[" "]" xs
+        ATup a xs -> agg' a "{" "}" xs
+        AVec a xs -> agg' a "<" ">" xs
+        where
+          agg' a l r xs = do
+            xs' <- foriM xs $ \ i x -> go (i:ss) x
+            return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
+          base s = lift $ atomG s
+          fillHole ss x = do
+            x' <- lift $ atomG x
+            p <- ("%ptr" <>) . show'' <$> lift gen
+            let t = atomAnno x ^. typ
+            let path = commaSep (map (\ i -> "i32 " <> show'' i) (0 : reverse ss))
+            tell $ F.fold
+              [ inst $ p <> " = getelementptr " <> pp ty <> ", " <> pty <> ", " <> path
+              , inst $ "store " <> x' <> ", " <> pp (PTy (Ptr t)) <> " " <> p
+              ]
   go :: ANF BVAnn -> GenM Doc
   go = \case
     AHalt x -> inst . ("ret " <>) <$> atomG x
@@ -1045,7 +1072,7 @@ anfG graph bbs = go where
           [ x .= ("tail call " <> pp t <> " " <> f' <> xs')
           , return . inst $ "ret " <> pp t <> " " <> varG x
           ]
-    ACase a x lpes -> do
+    ACase a x lpes ->
       case [r | r@(_, (_, (Nothing, _))) <- zip [0..] lpes] of
         [] -> do
           l <- gen
@@ -1098,7 +1125,7 @@ anfG graph bbs = go where
         y' <- atomG y
         ss' <- gepPath ss
         ret e =<< x .= ("extractelement " <> y' <> ", " <> ss')
-      t | (case t of Arr _ _ -> True; Tup _ -> True; _ -> False) -> do
+      t | case t of Arr _ _ -> True; Tup _ -> True; _ -> False -> do
         y' <- atomG y
         let ss' = simplePath ss
         ret e =<< x .= ("extractvalue " <> y' <> ", " <> ss')
@@ -1122,48 +1149,18 @@ anfG graph bbs = go where
         ss' <- gepPath ss
         z' <- atomG z
         ret e =<< x .= ("insertelement " <> y' <> ", " <> z' <> ", " <> ss')
-      t | (case t of Arr _ _ -> True; Tup _ -> True; _ -> False) -> do
+      t | case t of Arr _ _ -> True; Tup _ -> True; _ -> False -> do
         y' <- atomG y
         let ss' = simplePath ss
         z' <- atomG z
         ret e =<< x .= ("insertvalue " <> y' <> ", " <> z' <> ", " <> ss')
       t -> error $ "Update got type " ++ show t
     where
-      storeG s ty p = do
-        (s', w) <- runWriterT (go [] s)
-        return $ (inst $ "store " <> s' <> ", " <> pty) <> w
-        where
-          pty = pp (PTy (Ptr ty)) <> " " <> p
-          go ss s = case s of
-            AVar a _ -> case ss of
-              [] -> base s
-              _ -> do
-                fillHole ss s
-                return $ pp (a^.typ) <> " undef"
-            AExtVar _ _ -> base s
-            AInt _ _ _ -> base s
-            AArr a xs -> agg' a "[" "]" xs
-            ATup a xs -> agg' a "{" "}" xs
-            AVec a xs -> agg' a "<" ">" xs
-            where
-              agg' a l r xs = do
-                xs' <- foriM xs $ \ i x -> go (i:ss) x
-                return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
-              base s = lift $ atomG s
-              fillHole ss x = do
-                x' <- lift $ atomG x
-                p <- ("%ptr" <>) . show'' <$> lift gen
-                let t = atomAnno x ^. typ
-                let path = commaSep (map (\ i -> "i32 " <> show'' i) (0 : reverse ss))
-                tell $ F.fold
-                  [ inst $ p <> " = getelementptr " <> pp ty <> ", " <> pty <> ", " <> path
-                  , inst $ "store " <> x' <> ", " <> pp (PTy (Ptr t)) <> " " <> p
-                  ]
       simplePath ss = commaSep . for ss $ \case
         AProj _ n -> show'' n
         AIndexA _ n -> show'' n
-        AElem _ -> error $ "simplePath: AElem"
-        AIndex _ -> error $ "simplePath: AIndex"
+        AElem _ -> error "simplePath: AElem"
+        AIndex _ -> error "simplePath: AIndex"
       gepPath ss = fmap commaSep . forM ss $ \case
         AProj _ n -> return $ "i32 " <> show'' n
         AElem x -> atomG x
@@ -1205,7 +1202,7 @@ mainG extEnv graph bbs e =
   let extDecls = foldMap mkDecl (M.toList extEnv) in
   globals <> F.fold
     [ foldMap (line' . mkDecl) (M.toList extEnv)
-    , line' $ "define i32 @main() {"
+    , line' "define i32 @main() {"
     , body
     , line' "}"
     ]
@@ -1261,14 +1258,14 @@ instance PP (Exp a) where
     Let _ x t e1 e -> F.fold
       [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
       , indent (pp e1)
-      , line' $ "in "
+      , line' "in "
       , pp e
       ]
     Call _ f es -> pp f <> "(" <> commaSep (map (indent . pp) es) <> ")"
     Case _ e apes -> F.fold
       [ line' $ "case " <> pp e <> " {"
       , indent $ commaSep (map goArm apes)
-      , line' $ "}"
+      , line' "}"
       ]
       where
         goArm = \case
@@ -1276,7 +1273,7 @@ instance PP (Exp a) where
           Nothing :=> e -> line' $ "_ => " <> indent (pp e)
     Rec _ fs e -> F.fold
       [ line' $ goFuncs "rec " fs
-      , line' $ "in "
+      , line' "in "
       , pp e
       ]
       where
@@ -1338,7 +1335,7 @@ instance PP (ANF a) where
     ACase _ x lpes -> F.fold
       [ line' $ "case " <> pp x <> " {"
       , indent $ commaSep (map goArm lpes)
-      , line' $ "}"
+      , line' "}"
       ]
       where
         goArm = \case
@@ -1346,7 +1343,7 @@ instance PP (ANF a) where
           (l, (Nothing, e)) -> line' $ "_ => " <> show'' l <> ": " <> indent (pp e)
     ARec _ fs l e -> F.fold
       [ line' $ goFuncs "rec " fs
-      , line' $ "in "
+      , line' "in "
       , line' $ show'' l <> ": "
       , indent $ pp e
       ]
@@ -1495,7 +1492,7 @@ funcP =
     argP = (,,) <$> locP <*> varP <* symbol ":" <*> tyP
 
 armP :: Parser (Arm ParseAnn)
-armP = (:=>) <$> (tryAll [Just <$> intP, symbol "_" $> Nothing]) <* symbol "=>" <*> expP
+armP = (:=>) <$> tryAll [Just <$> intP, symbol "_" $> Nothing] <* symbol "=>" <*> expP
 
 externP :: Parser ()
 externP = do
@@ -1540,7 +1537,7 @@ expP' inGep = do
     , pure e
     ]
   where
-    updates loc e pes = L.foldl' (\ e (p, e1) -> Update loc e p e1) e pes
+    updates loc = L.foldl' (\ e (p, e1) -> Update loc e p e1)
 
 expP :: Parser (Exp ParseAnn)
 expP = expP' False
