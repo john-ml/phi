@@ -572,8 +572,8 @@ infer = \case
 --    because `ret`'s operand must be either a variable or an aggregate constant.
 -- This pass gets around this issue as follows:
 -- 1. Before conversion to ANF:
---    2a. Rewrite stores p <- e; .. ~~> p <- e' with {..}; ..
---    2b. Rewrite structure returns e ~~> e' with {..}
+--    1a. Rewrite stores p <- e; .. ~~> p <- e' with {..}; ..
+--    1b. Rewrite structure returns e ~~> e' with {..}
 --    where:
 --    - The `with` clause contains a path + expression for every non-constant hole
 --    - e' is e with all non-constant holes replaced by `undef`
