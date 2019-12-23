@@ -1032,7 +1032,10 @@ anfG graph bbs = go where
     ACall a x t f xs e -> do
       f' <- opG f
       xs' <- args xs
-      ret e =<< x .= ("call " <> pp t <> " " <> f' <> xs')
+      let call = "call " <> pp t <> " " <> f' <> xs'
+      ret e =<< case t of
+        Void -> pure $ inst call
+        _ -> x .= call
     ATail a x t f xs -> case f of
       AVar _ f | f ∈ bbs -> return . inst $ "br label " <> varG f
       _ -> do
