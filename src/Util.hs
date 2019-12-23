@@ -55,7 +55,7 @@ fixed f x =
 
 -- -------------------- Pattern synonyms --------------------
 
-pattern p :∧: q <- ((\ x -> (x, x)) -> (p, q))
+pattern p :∧: q <- (\ x -> (x, x) -> (p, q))
 
 -- -------------------- Pretty-printing --------------------
 

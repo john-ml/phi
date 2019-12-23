@@ -556,6 +556,87 @@ infer = \case
               return (t', Index e' : ss')
             (te, anno -> a) -> raise a $ ExGotShape "integer" te
 
+-- -------------------- Aggregate unfolding --------------------
+-- LLVM has some unfortunate restrictions on aggregates that make it hard to
+-- use as an expression language:
+-- 1. Naively translating stores
+--      .. <- e; ..
+--    into `store` instructions won't work because `store` requires that `e` be
+--    either a variable or a aggregate constant. For example,
+--      .. <- {1, x}; ..
+--    isn't allowed.
+-- 2. A similar restrictions exists for return values:
+--      rec f(x: i32): {i32, i32} = {1, x} in ...
+--    can't be translated into a function ending in
+--      ret {i32, i32} {i32 1, i32 %x}
+--    because `ret`'s operand must be either a variable or an aggregate constant.
+-- This pass gets around this issue as follows:
+-- 2. Before conversion to ANF:
+--    2a. Rewrite stores p <- e; .. ~~> p <- e' with {..}; ..
+--    2b. Rewrite structure returns e ~~> e' with {..}
+--    where:
+--    - The `with` clause contains a path + expression for every non-constant hole
+--    - e' is e with all non-constant holes replaced by `undef`
+-- 3. Conversion to ANF will automatically generate intermediate instructions to fill out
+--    holes etc. and ensure that `store`s and `ret`s only receive variables or aggregate
+--    constants.
+
+unfoldAggs :: Exp TyAnn -> Exp TyAnn
+unfoldAggs = go where
+  go exp = case exp of
+    Var{} -> exp
+    Undef{} -> exp
+    Null{} -> exp
+    ExtVar{} -> exp
+    Alloca a e -> Alloca a (go e)
+    Int{} -> exp
+    Ann a e ty -> Ann a (go e) ty
+    Prim a p es -> Prim a p (go <$> es)
+    Coerce a e t -> Coerce a (go e) t
+    Let a x t e1 e -> Let a x t (go e1) (go e)
+    Call a e es -> Call a (go e) (go <$> es)
+    Case a e pes -> Case a (go e) (for pes $ \ (p :=> e) -> p :=> go e)
+    Rec a helpers e ->
+      Rec a (for helpers $ \ (Func a f xts t e) -> Func a f xts t (go e)) (go e)
+    Array{} -> goAgg exp
+    Tuple{} -> goAgg exp
+    Vector{} -> goAgg exp
+    Gep a e p -> Gep a (go e) (goPath p)
+    Load a e p -> Load a (go e) (goPath p)
+    Store a dst p src e -> Store a (go dst) (goPath p) (go src) (go e)
+    Update a e p e1 -> Update a (go e) (goPath p) (go e1)
+  goPath (Path ss) = Path (goStep <$> ss)
+  goStep s = case s of
+    Proj{} -> s
+    IndexA{} -> s
+    Elem e -> Elem (go e)
+    Index e -> Index (go e)
+  goAgg e = 
+    let (e', pes) = goAgg' [] e `runState` [] in
+    L.foldl' (\ e (ss, e') -> Update (anno e) e (Path (reverse ss)) (go e')) e' pes
+  goAgg' ss = \case
+    Array a es -> Array a <$> goChildren IndexA es
+    Tuple a es -> Tuple a <$> goChildren Proj es
+    Vector a es -> do
+      es' <- foriM es $ \ i e -> case e of
+        Int{} -> return $ go e
+        ExtVar{} -> return $ go e
+        Undef{} -> return $ go e
+        Null{} -> return $ go e
+        (anno -> a) -> add (Elem (Int a (fromIntegral i) 32) : ss) e $> Undef a
+      return $ Vector a es'
+    where
+      add ss e = modify' ((ss, e) :)
+      goChildren f es =
+        foriM es $ \ i e -> let s = f (anno e) (fromIntegral i) in case e of
+          Array{} -> goAgg' (s:ss) e
+          Tuple{} -> goAgg' (s:ss) e
+          Int{} -> return $ go e
+          ExtVar{} -> return $ go e
+          Undef{} -> return $ go e
+          Null{} -> return $ go e
+          e -> add (s:ss) e $> Undef (anno e)
+
 -- -------------------- Conversion to ANF --------------------
 
 data Atom a
@@ -1029,49 +1110,11 @@ anfG graph bbs = go where
     , body
     ]
   ret e line = (line <>) <$> go e
-  -- TODO: alter to work with returning structs too e.g. ret {i32, i32} {i32 0, i32 %x}
-  -- Now that we have undef, this solution is better:
-  -- 1. Delete this function entirely.
-  -- 2. Before conversion to ANF:
-  --    2a. Rewrite stores p <- e; .. to be p <- e' with {..}; ..
-  --    2b. Rewrite structure returns e to e' with {..}
-  --    where the with clause contains a path + expression for every non-constant hole
-  --    and e' is e with all non-constant holes replaced by undef
-  -- 3. Conversion to ANF will generate intermediate instructions to fill out holes etc.
-  --    and ensure that stores and rets only receive variables as arguments.
   storeG :: Atom BVAnn -> Ty -> Doc -> GenM Doc
   storeG s ty p = do
-    (s', w) <- runWriterT (go [] s)
-    return $ inst ("store " <> s' <> ", " <> pty) <> w
-    where
-      pty = pp (PTy (Ptr ty)) <> " " <> p
-      go ss s = case s of
-        AVar a _ -> case ss of
-          [] -> base s
-          _ -> do
-            fillHole ss s
-            return $ pp (a^.typ) <> " undef"
-        AUndef _ -> base s
-        ANull _ -> base s
-        AExtVar _ _ -> base s
-        AInt _ _ _ -> base s
-        AArr a xs -> agg' a "[" "]" xs
-        ATup a xs -> agg' a "{" "}" xs
-        AVec a xs -> agg' a "<" ">" xs
-        where
-          agg' a l r xs = do
-            xs' <- foriM xs $ \ i x -> go (i:ss) x
-            return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
-          base s = lift $ atomG s
-          fillHole ss x = do
-            x' <- lift $ atomG x
-            p <- ("%ptr" <>) . show'' <$> lift gen
-            let t = atomAnno x ^. typ
-            let path = commaSep (map (\ i -> "i32 " <> show'' i) (0 : reverse ss))
-            tell $ F.fold
-              [ inst $ p <> " = getelementptr " <> pp ty <> ", " <> pty <> ", " <> path
-              , inst $ "store " <> x' <> ", " <> pp (PTy (Ptr t)) <> " " <> p
-              ]
+    s' <- atomG s
+    let ty = PTy (Ptr (atomAnno s ^. typ))
+    return . inst $ "store " <> s' <> ", " <> pp ty <> " " <> p
   go :: ANF BVAnn -> GenM Doc
   go = \case
     AHalt x -> inst . ("ret " <>) <$> atomG x
@@ -1291,7 +1334,7 @@ instance PP (Exp a) where
     Undef _ -> "undef"
     Null _ -> "null"
     ExtVar _ s -> fromString s
-    Alloca _ e -> "ref " <> pp e
+    Alloca _ e -> "ref (" <> pp e <> ")"
     Int _ i w -> show'' i <> "i" <> show'' w
     Ann _ e ty -> pp e <> ": " <> pp ty
     Prim _ p es -> pp p <> "(" <> commaSep (map (indent . pp) es) <> ")"
@@ -1603,7 +1646,9 @@ compile :: String -> Either String String
 compile s = do
   let (r, (names, extEnv)) = parse' "" s
   e <- ub <$> r
-  anf <- annoBV . annoFV . toTails . toANF <$> runTC (check e (PTy (I 32))) extEnv
+  e <- runTC (check e (PTy (I 32))) extEnv
+  let e' = unfoldAggs e
+  let anf = annoBV . annoFV . toTails . toANF . unfoldAggs $ trace (runDoc (pp e')) e'
   let graph = graphOf anf
   let bvs = bvsOf anf
   let l = liveness bvs graph anf

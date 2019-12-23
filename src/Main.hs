@@ -278,6 +278,7 @@ tests = do
     , "  ref([104i8, 101i8, 108i8, 108i8, 111i8, 32i8, 119i8, 111i8, 114i8, 108i8, 100i8, 0i8]) as *i8)"
     , "in 0"
     ]
+  either putStrLn putStrLn . compile $ "rec f(x: i32): {i32, i32} = {x, x} in 0"
 
 main = getArgs >>= \case
   ["test"] -> tests
