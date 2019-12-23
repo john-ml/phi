@@ -571,13 +571,13 @@ infer = \case
 --      ret {i32, i32} {i32 1, i32 %x}
 --    because `ret`'s operand must be either a variable or an aggregate constant.
 -- This pass gets around this issue as follows:
--- 2. Before conversion to ANF:
+-- 1. Before conversion to ANF:
 --    2a. Rewrite stores p <- e; .. ~~> p <- e' with {..}; ..
 --    2b. Rewrite structure returns e ~~> e' with {..}
 --    where:
 --    - The `with` clause contains a path + expression for every non-constant hole
 --    - e' is e with all non-constant holes replaced by `undef`
--- 3. Conversion to ANF will automatically generate intermediate instructions to fill out
+-- 2. Conversion to ANF will automatically generate intermediate instructions to fill out
 --    holes etc. and ensure that `store`s and `ret`s only receive variables or aggregate
 --    constants.
 
@@ -1110,8 +1110,8 @@ anfG graph bbs = go where
     , body
     ]
   ret e line = (line <>) <$> go e
-  storeG :: Atom BVAnn -> Ty -> Doc -> GenM Doc
-  storeG s ty p = do
+  storeG :: Atom BVAnn -> Doc -> GenM Doc
+  storeG s p = do
     s' <- atomG s
     let ty = PTy (Ptr (atomAnno s ^. typ))
     return . inst $ "store " <> s' <> ", " <> pp ty <> " " <> p
@@ -1123,7 +1123,7 @@ anfG graph bbs = go where
       p <- gen
       let t = atomAnno y ^. typ
       alloca <- x .= ("alloca " <> pp t)
-      store <- storeG y t (varG x)
+      store <- storeG y (varG x)
       ret e $ alloca <> store
     APrim a x t p xs e -> case p of
       ShuffleVector -> do
@@ -1218,7 +1218,7 @@ anfG graph bbs = go where
         ss' <- gepPath ss
         e' <- go e
         p <- gen
-        store <- storeG s (atomAnno s ^. typ) ("%ptr" <> show'' p)
+        store <- storeG s ("%ptr" <> show'' p)
         return $ F.fold
           [ inst $ "%ptr" <> show'' p <> " = getelementptr " <> pp t <> ", " <> d' <> ", " <> ss'
           , store
@@ -1647,8 +1647,7 @@ compile s = do
   let (r, (names, extEnv)) = parse' "" s
   e <- ub <$> r
   e <- runTC (check e (PTy (I 32))) extEnv
-  let e' = unfoldAggs e
-  let anf = annoBV . annoFV . toTails . toANF . unfoldAggs $ trace (runDoc (pp e')) e'
+  let anf = annoBV . annoFV . toTails . toANF $ unfoldAggs e
   let graph = graphOf anf
   let bvs = bvsOf anf
   let l = liveness bvs graph anf
