@@ -18,4 +18,4 @@ functions to make it bearable for humans.
 - [ ] Type aliases
 - [ ] (Recursive) type declarations
 - [ ] Infix parsing
-- [ ] Generalize `store`: in LLVM, `.. <- [.., ..]; ..` only allowed for constant `[.., ..]`
+- [x] Generalize `store`: in LLVM, `.. <- [.., ..]; ..` only allowed for constant `[.., ..]`

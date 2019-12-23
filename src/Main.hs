@@ -221,10 +221,10 @@ tests = do
     , "in f(ref({2, [5, 6]}))"
     ]
   either putStrLn putStrLn . compile $ unlines
-    [ "rec f(xs: *{i32, [2 x i32]}, i: i32): i32 ="
-    , "  xs[0].1 <- [3, i];"
+    [ "rec f(xs: *{i32, {[2 x i32], i32}}, i: i32): i32 ="
+    , "  xs[0].1.0 <- [3, i];"
     , "  0"
-    , "in f(ref({2, [5, 6]}), 1)"
+    , "in f(ref({2, {[5, 6], 7}}), 1)"
     ]
 
 main = getArgs >>= \case
@@ -233,4 +233,4 @@ main = getArgs >>= \case
   _ -> do
     putStrLn "Usage:"
     putStrLn "  phi test (run some tests)"
-    putStrLn "  phi in.φ (compile in.φ to llvm)"
+    putStrLn "  phi in.φ (compile in.φ to LLVM IR)"

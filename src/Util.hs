@@ -27,6 +27,9 @@ acciM xs e f = snd <$> foldM (\ (i, b) a -> (i + 1, ) <$> f i b a) (0, e) xs
 for2 :: [a] -> [b] -> (a -> b -> c) -> [c]
 for2 xs ys f = zipWith f xs ys
 
+foriM :: (Enum i, Num i, Monad m) => [a] -> (i -> a -> m b) -> m [b]
+foriM xs f = zipWithM f [0..] xs
+
 for :: [a] -> (a -> b) -> [b]
 for xs f = map f xs
 

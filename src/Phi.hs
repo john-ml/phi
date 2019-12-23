@@ -988,8 +988,9 @@ anfG graph bbs = go where
     AAlloca a x pt y e -> do
       y' <- atomG y
       p <- gen
-      alloca <- x .= ("alloca " <> pp (atomAnno y ^. typ))
-      let store = inst $ "store " <> y' <> ", " <> pp pt <> " " <> varG x
+      let t = atomAnno y ^. typ
+      alloca <- x .= ("alloca " <> pp t)
+      store <- storeG y t (varG x)
       ret e $ alloca <> store
     APrim a x t p xs e -> do
       xs' <- commaSep <$> mapM opG xs
@@ -1075,12 +1076,12 @@ anfG graph bbs = go where
       PTy (Ptr t) -> do
         d' <- atomG d
         ss' <- gepPath ss
-        s' <- atomG s
         e' <- go e
         p <- gen
+        store <- storeG s (atomAnno s ^. typ) ("%ptr" <> show'' p)
         return $ F.fold
           [ inst $ "%ptr" <> show'' p <> " = getelementptr " <> pp t <> ", " <> d' <> ", " <> ss'
-          , inst $ "store " <> s' <> ", " <> pp (PTy (Ptr (atomAnno s ^. typ))) <> " %ptr" <> show'' p
+          , store
           , e'
           ]
       t -> error $ "Store got type " ++ show t
@@ -1100,6 +1101,36 @@ anfG graph bbs = go where
         ret e =<< x .= ("insertvalue " <> y' <> ", " <> z' <> ", " <> ss')
       t -> error $ "Update got type " ++ show t
     where
+      storeG s ty p = do
+        (s', w) <- runWriterT (go [] s)
+        return $ (inst $ "store " <> s' <> ", " <> pty) <> w
+        where
+          pty = pp (PTy (Ptr ty)) <> " " <> p
+          go ss s = case s of
+            AVar a _ -> case ss of
+              [] -> base s
+              _ -> do
+                fillHole ss s
+                return $ pp (a^.typ) <> " undef"
+            AExtVar _ _ -> base s
+            AInt _ _ _ -> base s
+            AArr a xs -> agg' a "[" "]" xs
+            ATup a xs -> agg' a "{" "}" xs
+            AVec a xs -> agg' a "<" ">" xs
+            where
+              agg' a l r xs = do
+                xs' <- foriM xs $ \ i x -> go (i:ss) x
+                return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
+              base s = lift $ atomG s
+              fillHole ss x = do
+                x' <- lift $ atomG x
+                p <- ("%ptr" <>) . show'' <$> lift gen
+                let t = atomAnno x ^. typ
+                let path = commaSep (map (\ i -> "i32 " <> show'' i) (0 : reverse ss))
+                tell $ F.fold
+                  [ inst $ p <> " = getelementptr " <> pp ty <> ", " <> pty <> ", " <> path
+                  , inst $ "store " <> x' <> ", " <> pp (PTy (Ptr t)) <> " " <> p
+                  ]
       simplePath ss = commaSep . for ss $ \case
         AProj _ n -> show'' n
         AIndexA _ n -> show'' n
