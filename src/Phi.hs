@@ -131,6 +131,16 @@ data Exp a
 --   It's impossible for two distinct functions f and f' to call a BB g because both would
 --   have to have killed the same set of variables (violating UB).
 
+-- -------------------- Primitives --------------------
+
+numOp :: Prim -> Bool
+numOp = \case
+  Add -> True
+  Mul -> True
+  Sub -> True
+  Div -> True
+  _ -> False
+
 -- -------------------- Some boilerplate to work with annotations --------------------
 
 makeLabelable "loc hasUB typ fvSet bvSet hasTail"
@@ -373,10 +383,7 @@ checkNumOp a = \case
 
 checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
 checkPrim a es = \case
-  Add -> checkNumOp a es
-  Mul -> checkNumOp a es
-  Sub -> checkNumOp a es
-  Div -> checkNumOp a es
+  p | numOp p -> checkNumOp a es
   ShuffleVector -> case es of
     [v1, v2, mask] -> case mask of
       Vector a es -> do
