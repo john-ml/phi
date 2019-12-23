@@ -41,6 +41,7 @@ import Control.Lens
 -- Primitives
 data Prim
   = Add | Sub | Mul | Div
+  | ShuffleVector
   deriving (Eq, Ord, Show)
 
 -- Primitive types
@@ -376,6 +377,22 @@ checkPrim a es = \case
   Mul -> checkNumOp a es
   Sub -> checkNumOp a es
   Div -> checkNumOp a es
+  ShuffleVector -> case es of
+    [v1, v2, mask] -> case mask of
+      Vector a es -> do
+        es' <- forM es $ \case
+          Int a i 32 -> do
+            let ty = PTy (I 32)
+            return $ Int (typ .==. ty .*. a) i 32
+          (anno -> a) -> raise a $ Custom "shuffle mask must contain i32 constants"
+        infer v1 >>= \case
+          (t@(Vec _ elt), v1') -> do
+            v2' <- check v2 t
+            let n = L.genericLength es
+            return (Vec n elt, [v1', v2', Vector (typ .==. Vec n (I 32) .*. a) es'])
+          (t, _) -> raise (anno v1) $ ExGotShape "vector" t
+      (anno -> a) -> raise a $ Custom "shuffle mask must be a vector constant"
+    _ -> raise a $ Custom "shufflevector expects 3 arguments: v1, v2, and shuffle mask"
 
 var :: UBAnn -> Var -> TC (Ty, Exp TyAnn)
 var a x = do
@@ -992,9 +1009,13 @@ anfG graph bbs = go where
       alloca <- x .= ("alloca " <> pp t)
       store <- storeG y t (varG x)
       ret e $ alloca <> store
-    APrim a x t p xs e -> do
-      xs' <- commaSep <$> mapM opG xs
-      ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
+    APrim a x t p xs e -> case p of
+      ShuffleVector -> do
+        xs' <- commaSep <$> mapM atomG xs
+        ret e =<< x .= (pp p <> " " <> xs')
+      _ -> do
+        xs' <- commaSep <$> mapM opG xs
+        ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
     ACoerce a x t y e ->
       case (t, atomAnno y ^. typ) of
         (t2@(PTy (Ptr _)), t1@(PTy (Ptr _))) -> do
@@ -1085,9 +1106,6 @@ anfG graph bbs = go where
           , e'
           ]
       t -> error $ "Store got type " ++ show t
-      -- TODO: generalize the store used here and in AAlloca. Specifically, if the value
-      -- being stored contains nonconst values, emit "undef" in initial store.
-      -- Then emit a proper gep + stre for each "undef hole"
     AUpdate a x t y (APath ss) z e -> case atomAnno y ^. typ of
       Vec _ _ -> do
         y' <- atomG y
@@ -1214,6 +1232,7 @@ instance PP Prim where
     Mul -> "mul"
     Sub -> "sub"
     Div -> "div"
+    ShuffleVector -> "shufflevector"
 
 instance PP (Func a) where
   pp (Func _ f xts t e) =
@@ -1438,6 +1457,7 @@ primP = tryAll
   , symbol "mul" $> Mul
   , symbol "sub" $> Sub
   , symbol "div" $> Div
+  , symbol "shufflevector" $> ShuffleVector
   ]
 
 locP :: Parser ParseAnn = (\ pos -> loc .==. pos .*. emptyRecord) <$> P.getSourcePos

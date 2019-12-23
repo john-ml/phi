@@ -19,3 +19,6 @@ functions to make it bearable for humans.
 - [ ] (Recursive) type declarations
 - [ ] Infix parsing
 - [x] Generalize `store`: in LLVM, `.. <- [.., ..]; ..` only allowed for constant `[.., ..]`
+- [ ] Better bidirectional checking
+- [ ] Codegen cleanup
+- [ ] Undef
