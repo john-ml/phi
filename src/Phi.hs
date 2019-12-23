@@ -87,6 +87,8 @@ data Arm a = Maybe Integer :=> Exp a deriving (THEUSUAL)
 data Exp a
   -- Primitives
   = Var a Var
+  | Undef a
+  | Null a
   | ExtVar a String
   | Alloca a (Exp a)
   | Int a Integer Width
@@ -149,6 +151,8 @@ makeLabelable "loc hasUB typ fvSet bvSet hasTail"
 anno :: Exp a -> a
 anno = \case
   Var a _ -> a
+  Undef a -> a
+  Null a -> a
   ExtVar a _ -> a
   Alloca a _ -> a
   Int a _ _ -> a
@@ -221,6 +225,8 @@ gen = modify' succ *> get
 foldVars :: Monoid m => (Var -> m) -> Exp a -> m
 foldVars f = \case
   Var _ x -> f x
+  Undef _ -> mempty
+  Null _ -> mempty
   ExtVar _ _ -> mempty
   Alloca _ e -> go e
   Int _ _ _ -> mempty
@@ -264,6 +270,8 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
   goAnn a = hasUB .==. HasUB .*. a
   go σ = \case
     Var a x -> return $ Var a (σ ! x)
+    Undef a -> return $ Undef a
+    Null a -> return $ Null a
     ExtVar a s -> return $ ExtVar a s
     Alloca a e -> Alloca a <$> go σ e
     Int a i w -> return $ Int a i w
@@ -354,6 +362,10 @@ extLookup a s = (M.!? s) . snd <$> ask >>= \case
 
 check :: Exp UBAnn -> Ty -> TC (Exp TyAnn)
 check exp ty = case exp of
+  Undef a -> return $ Undef (typ .==. ty .*. a)
+  Null a -> case ty of
+    PTy (Ptr ty') -> return $ Null (typ .==. ty .*. a)
+    ty -> raise a $ ExGotShape "pointer" ty
   Case a e pes -> infer e >>= \case
     (PTy (I _), e') -> do
       pes' <- mapM (\ (p :=> e) -> (p :=>) <$> check e ty) pes
@@ -503,6 +515,7 @@ infer = \case
       e1' <- check e1 t
       return (ty, Update (typ .==. ty .*. a) e' (Path ss') e1')
     (t, anno -> a) -> raise a $ ExGotShape "one of {tuple, array, vector}" t
+  e -> raise (anno e) $ Custom "Can't infer the type of this expression"
   where
     okForGep a = \case
       ss@(Index _ : _) -> return ss
@@ -547,6 +560,8 @@ infer = \case
 
 data Atom a
   = AVar a Var
+  | AUndef a
+  | ANull a
   | AExtVar a String
   | AInt a Integer Width
   | AArr a [Atom a]
@@ -591,6 +606,8 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
   go :: Map Var (Atom TyAnn) -> Exp TyAnn -> State (Var, ANF TyAnn -> ANF TyAnn) (Atom TyAnn)
   go σ = \case
     Var a x -> return $ M.findWithDefault (AVar a x) x σ
+    Undef a -> return $ AUndef a
+    Null a -> return $ ANull a
     ExtVar a s -> return $ AExtVar a s
     Alloca a e -> do
       e' <- go σ e
@@ -702,6 +719,8 @@ toTails = fmap (hasTail .==. HasTail .*.) . go where
 atomAnno :: Atom a -> a
 atomAnno = \case
   AVar a _ -> a
+  AUndef a -> a
+  ANull a -> a
   AExtVar a _ -> a
   AInt a _ _ -> a
   AArr a _ -> a
@@ -748,6 +767,8 @@ annoFV = go where
   goAtom :: Atom TailAnn -> Atom FVAnn
   goAtom = \case
     AVar a x -> AVar (set (S.singleton x) a) x
+    AUndef a -> AUndef (set S.empty a)
+    ANull a -> ANull (set S.empty a)
     AExtVar a s -> AExtVar (set S.empty a) s
     AInt a i w -> AInt (set S.empty a) i w
     AArr a (map goAtom -> xs) -> AArr (set (foldMap atomFVs xs) a) xs
@@ -814,6 +835,8 @@ annoBV = go where
   goAtom :: Atom FVAnn -> Atom BVAnn
   goAtom = \case
     AVar a x -> AVar (set S.empty a) x
+    AUndef a -> AUndef (set S.empty a)
+    ANull a -> ANull (set S.empty a)
     AExtVar a s -> AExtVar (set S.empty a) s
     AInt a i w -> AInt (set S.empty a) i w
     AArr a (map goAtom -> xs) -> AArr (set S.empty a) xs
@@ -984,6 +1007,8 @@ anfG graph bbs = go where
   agg a l r xs = do xs' <- mapM atomG xs; return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
   atomG = \case
     AVar a x -> do x' <- varG' x; return $ pp (a^.typ) <> " " <> x'
+    AUndef a -> return $ pp (a^.typ) <> " undef"
+    ANull a -> return $ pp (a^.typ) <> " null"
     AExtVar a s -> return $ pp (a^.typ) <> " @" <> fromString s
     AInt _ i w -> return $ "i" <> show'' w <> " " <> show'' i
     AArr a xs -> agg a "[" "]" xs
@@ -992,6 +1017,8 @@ anfG graph bbs = go where
   -- Like atomG, but omits the type annotation and can't do compound atoms
   opG = \case
     AVar _ x -> varG' x
+    AUndef _ -> return "undef"
+    ANull _ -> return "null"
     AExtVar _ s -> return $ "@" <> fromString s
     AInt _ i _ -> return $ show'' i
     a -> error $ "opG got compound atom: " ++ show a
@@ -1002,6 +1029,16 @@ anfG graph bbs = go where
     , body
     ]
   ret e line = (line <>) <$> go e
+  -- TODO: alter to work with returning structs too e.g. ret {i32, i32} {i32 0, i32 %x}
+  -- Now that we have undef, this solution is better:
+  -- 1. Delete this function entirely.
+  -- 2. Before conversion to ANF:
+  --    2a. Rewrite stores p <- e; .. to be p <- e' with {..}; ..
+  --    2b. Rewrite structure returns e to e' with {..}
+  --    where the with clause contains a path + expression for every non-constant hole
+  --    and e' is e with all non-constant holes replaced by undef
+  -- 3. Conversion to ANF will generate intermediate instructions to fill out holes etc.
+  --    and ensure that stores and rets only receive variables as arguments.
   storeG :: Atom BVAnn -> Ty -> Doc -> GenM Doc
   storeG s ty p = do
     (s', w) <- runWriterT (go [] s)
@@ -1014,6 +1051,8 @@ anfG graph bbs = go where
           _ -> do
             fillHole ss s
             return $ pp (a^.typ) <> " undef"
+        AUndef _ -> base s
+        ANull _ -> base s
         AExtVar _ _ -> base s
         AInt _ _ _ -> base s
         AArr a xs -> agg' a "[" "]" xs
@@ -1249,6 +1288,8 @@ instance PP (Func a) where
 instance PP (Exp a) where
   pp = \case
     Var _ x -> show'' x
+    Undef _ -> "undef"
+    Null _ -> "null"
     ExtVar _ s -> fromString s
     Alloca _ e -> "ref " <> pp e
     Int _ i w -> show'' i <> "i" <> show'' w
@@ -1311,6 +1352,8 @@ instance PP (Step a) where
 instance PP (Atom a) where
   pp = \case
     AVar _ x -> show'' x
+    AUndef _ -> "undef"
+    ANull _ -> "null"
     AExtVar _ s -> fromString s
     AInt _ i w -> show'' i <> "i" <> show'' w
     AArr _ xs -> "[" <> commaSep (map (indent . pp) xs) <> "]"
@@ -1506,6 +1549,8 @@ expP' inGep = do
   e <- tryAll
     [ Int loc <$> intP <*> (P.try (symbol "i" *> widthP) <|> pure 32)
     , Prim loc <$> primP <*> tupleOf expP
+    , symbol "undef" $> Undef loc
+    , symbol "null" $> Null loc
     , symbol "let" >> Let loc
         <$> varP <* symbol ":" <*> tyP <* symbol "="
         <*> expP <* symbol "in" <*> expP

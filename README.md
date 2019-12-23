@@ -14,7 +14,6 @@ functions to make it bearable for humans.
 - [x] Load/store/functional update/GEP
 - [x] Aggregates (structs, vectors, arrays)
 - [x] Extern declarations
-- [ ] String literals?
 - [ ] Type aliases
 - [ ] (Recursive) type declarations
 - [ ] Infix parsing
