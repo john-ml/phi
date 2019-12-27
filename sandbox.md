@@ -1,3 +1,5 @@
+# Misc. 
+
 ## Type aliases / type declarations
 
 Use
@@ -15,14 +17,16 @@ to define a new type.
 
 `⟦ type X = ... ⟧` ==> `%⟦X⟧ = type { ⟦...⟧ }`
 
-## Partial evaluation / using `phi` as a target
+# Targetting `phi`
 
-Get rid of:
-- Polymorphism (monomorphize + specialize typeclasses/traits)
+## Evaluating away fancy features
+
 - "Higher" stuff (inline):
     - Higher order functions
     - Higher rank polymorphism
     - Higher-kinded types
+- Polymorphism (monomorphize + specialize typeclasses/traits)
+    - Can be viewed as a special case of "inlining higher stuff"
 - Closure stuff:
     - Currying (uncurry)
         - Best done after no polymorphism left. 
@@ -30,7 +34,12 @@ Get rid of:
             e.g. `forall a. a -> a` (what if `a := _ -> _`?).
     - Partial application (eta-expand)
         - Best done before uncurrying so every call is saturated
+        - May not be necessary if getting rid of all higher order functions
     - Non-tail-recursive functions where the continuation of every recursive call is "constructor-like"
         (make tail calls using mutation + hole-passing)
     - Non-tail-recursive nested functions which capture variables (lambda lift)
         - Ideally, these functions can't escape upwards because of uncurrying/eta expansion
+    - Explicit opt-in closures which get defunctionalized (e.g. dlist, nbe, lazy thunks)
+
+## Mutable updates
+

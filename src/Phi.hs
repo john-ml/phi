@@ -1065,7 +1065,7 @@ checkBBs graph bbs =
 
 type GenM =
   WriterT Doc -- Accumulate global defns
-  (ReaderT (Set Var) -- Known functions
+  (ReaderT (([Ty], Ty), Set Var) -- (Current function's prototype, known functions)
   (State Var)) -- Fresh label names
 
 mainLabel :: Doc = "%start"
@@ -1083,7 +1083,7 @@ inst = indent . line'
 anfG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> GenM Doc
 anfG graph bbs = go where
   varG' :: Var -> GenM Doc
-  varG' x = do known <- ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
+  varG' x = do known <- snd <$> ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
   args xs = do xs' <- mapM atomG xs; return $ "(" <> commaSep xs' <> ")"
   agg a l r xs = do xs' <- mapM atomG xs; return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
   atomG = \case
@@ -1150,8 +1150,11 @@ anfG graph bbs = go where
       _ -> do
         xs' <- args xs
         f' <- opG f
+        (ts', t') <- fst <$> ask
+        let ts = map (\ x -> atomAnno x ^. typ) xs
+        let must = if (ts, t) == (ts', t') then "must" else ""
         F.fold <$> sequence
-          [ x .= ("tail call " <> pp t <> " " <> f' <> xs')
+          [ x .= (must <> "tail call " <> pp t <> " " <> f' <> xs')
           , return . inst $ "ret " <> pp t <> " " <> varG x
           ]
     ACase a x lpes ->
@@ -1179,7 +1182,7 @@ anfG graph bbs = go where
             ]
     ARec a fs l e -> do
       let s = S.fromList (bundleNames fs)
-      (fs', e') <- local (s ∪) $ (,) <$> mapM goAFunc fs <*> go e
+      (fs', e') <- local (second (s ∪)) $ (,) <$> mapM goAFunc fs <*> go e
       return $ F.fold
         [ inst $ "br label " <> varG l
         , F.fold fs'
@@ -1268,7 +1271,7 @@ anfG graph bbs = go where
         e' <- go e
         phis <- zipWithM mkPhi xts actualss'
         return $ f <: (F.fold phis <> e')
-    | otherwise = do
+    | otherwise = let ts = map (\ (_, _, t) -> t) axts in local (first $ const (ts, t)) $ do
         e' <- go e
         tell $ F.fold
           [ let axts' = map (\ (_, x, t) -> pp t <> " " <> varG x) axts in
@@ -1280,8 +1283,12 @@ anfG graph bbs = go where
 
 mainG :: Map String Ty -> CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
 mainG extEnv graph bbs e =
-  let (body, globals) = runWriterT (anfG graph bbs e) `runReaderT` S.empty `evalState` 0 in
-  let extDecls = foldMap mkDecl (M.toList extEnv) in
+  let
+    (body, globals) = runWriterT (anfG graph bbs e)
+      `runReaderT` (([], PTy (I 32)), S.empty)
+      `evalState` 0
+    extDecls = foldMap mkDecl (M.toList extEnv)
+  in
   globals <> F.fold
     [ foldMap (line' . mkDecl) (M.toList extEnv)
     , line' "define i32 @main() {"
