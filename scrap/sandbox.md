@@ -43,3 +43,39 @@ to define a new type.
 
 ## Mutable updates
 
+It'd be nice to turn
+
+```ocaml
+let f(x: *i32): *i32 = new (*x + 1)
+```
+
+into
+
+```ocaml
+let f(x: *i32): *i32 =
+  *x <- *x + 1;
+  x
+```
+
+and
+
+```ocaml
+type L = *{i32, L}
+let rec f(xs: L): L =
+  match L {
+    null => null,
+    *{x, xs} => new {x + 1, f(xs)}
+  }
+```
+
+into
+
+```ocaml
+let rec f(xs: L): L =
+  match L {
+    null => null,
+    *{x, xs} =>
+      x <- x + 1;
+      f(xs)
+  }
+```
