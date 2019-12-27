@@ -9,7 +9,7 @@ functions to make it bearable for humans.
 ## TODO
 
 - [x] Parser, typechecker, and code generator for integer arithmetic + recursive functions
-- [ ] More aggressive basic block selection
+- [x] More aggressive basic block selection (or better tail calls)
 - [x] Allocas
 - [x] Load/store/functional update/GEP
 - [x] Aggregates (structs, vectors, arrays)
