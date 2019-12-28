@@ -46,7 +46,7 @@ to define a new type.
 It'd be nice to turn
 
 ```ocaml
-let f(x: *i32): *i32 = new (*x + 1)
+let f(x: *i32): *i32 = new *x + 1
 ```
 
 into
@@ -74,8 +74,32 @@ into
 let rec f(xs: L): L =
   match L {
     null => null,
-    *{x, xs} =>
-      x <- x + 1;
-      f(xs)
+    *{x, xs'} =>
+      xs <- {x + 1, f(xs')};
+      xs
   }
 ```
+
+which are both possible if the argument to `f` is a unique pointer.
+
+There may also be multiple modes of use; e.g.
+
+```ocaml
+let rec f(xs: L, ys: L): L =
+  match xs, ys {
+    null, _ => null,
+    _, null => null,
+    *{x, xs'}, *{y, ys'} => new {add(x, y), f(xs', ys')}
+  }
+```
+
+could choose to mutate either `xs` or `ys`.
+
+Maybe this can be done as follows:
+- Want to use region-based memory management (with mini per-region gc if necessary)
+    to allow for sharing and cycles
+- At same time, try to infer which pointers are "Rust-like" i.e. basically are
+    unique/owning pointer to a tree-like data structure where every substructure is
+    also unique
+- Instead of autofreeing when these pointers fall out of scope (region will handle
+    freeing everything), can reuse for new values ==> effectively get mutable update

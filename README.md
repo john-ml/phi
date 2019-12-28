@@ -1,9 +1,7 @@
 # phi
 
-Taking advantage of the fact that SSA happens to look
-[a lot like functional programming](https://www.cs.princeton.edu/~appel/papers/ssafun.pdf),
-this is a simple functional language which essentially allows one to write programs directly
-in LLVM IR. The programs are just dressed up in ML syntax and written as mutually recursive
+A simple functional language which basically lets you write programs in LLVM IR.
+The programs are just dressed up in ML syntax and written as mutually recursive
 functions to make it bearable for humans.
 
 ## TODO
