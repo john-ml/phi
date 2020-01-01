@@ -42,12 +42,26 @@ import Control.Lens
 
 -- -------------------- Object language --------------------
 
+data Bop = Add | Sub | Mul | Div deriving (THEUSUAL)
+
+data IDir
+  = Ieq | Ine
+  | Islt | Isgt | Isle | Isge
+  | Iult | Iugt | Iule | Iuge
+  deriving (THEUSUAL)
+
+data FDir
+  = Foeq | Fogt | Foge | Folt | Fole | Fone | Ford
+  | Fueq | Fugt | Fuge | Fult | Fule | Fune | Funo
+  deriving (THEUSUAL)
+
 -- Primitives
 data Prim
-  = Add | Sub | Mul | Div
+  = BinArith Bop 
+  | ICmp IDir
+  | FCmp FDir
   | ShuffleVector
   deriving (THEUSUAL)
-instance Plated Prim
 
 -- Primitive types
 data PTy
@@ -160,16 +174,6 @@ instance Data a => Plated (Atom a)
 --   functions f and BBs g where f calls g, f must have killed all variables live at g.
 --   It's impossible for two distinct functions f and f' to call a BB g because both would
 --   have to have killed the same set of variables (violating UB).
-
--- -------------------- Primitives --------------------
-
-numOp :: Prim -> Bool
-numOp = \case
-  Add -> True
-  Mul -> True
-  Sub -> True
-  Div -> True
-  _ -> False
 
 -- -------------------- Some boilerplate to work with annotations --------------------
 
@@ -446,9 +450,29 @@ checkNumOp a = \case
       PTy FP128 -> True
       _ -> False
 
+checkCmp :: UBAnn -> [Exp UBAnn] -> (Ty -> Bool) -> TC (Ty, [Exp TyAnn])
+checkCmp a es ok = case es of
+  [e1, e2] -> do
+    (t, e1') <- infer e1
+    unless (ok t) . raise a $ ExGotShape "one of {numeric type, pointer, <_ x numeric type>}" t
+    e2' <- check e2 t
+    return (t, [e1', e2'])
+
 checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
 checkPrim a es = \case
-  p | numOp p -> checkNumOp a es
+  BinArith _ -> checkNumOp a es
+  ICmp _ -> checkCmp a es . fix $ \ go -> \case
+    PTy (I _) -> True
+    PTy (Ptr _) -> True
+    Vec _ t' -> go (PTy t')
+    _ -> False
+  FCmp _ -> checkCmp a es . fix $ \ go -> \case
+    PTy Half -> True
+    PTy Float -> True
+    PTy Double -> True
+    PTy FP128 -> True
+    Vec _ t' -> go (PTy t')
+    _ -> False
   ShuffleVector -> case es of
     [v1, v2, mask] -> case mask of
       Vector a es -> do
@@ -1363,12 +1387,16 @@ instance PP Ty where
     TStruct s -> "%" <> fromString s
     FPtr ts t -> pp t <> "(" <> commaSep (map pp ts) <> ")*"
 
+instance PP Bop where pp = fromString . map toLower . show
+
+instance PP IDir where pp = fromString . tail . show
+instance PP FDir where pp = fromString . tail . show
+
 instance PP Prim where
   pp = \case
-    Add -> "add"
-    Mul -> "mul"
-    Sub -> "sub"
-    Div -> "div"
+    BinArith bop -> pp bop
+    ICmp dir -> "icmp " <> pp dir
+    FCmp dir -> "fcmp " <> pp dir
     ShuffleVector -> "shufflevector"
 
 instance PP (Func a) where
@@ -1620,10 +1648,34 @@ widthP :: Parser Width = wordP
 
 primP :: Parser Prim
 primP = tryAll
-  [ symbol "add" $> Add
-  , symbol "mul" $> Mul
-  , symbol "sub" $> Sub
-  , symbol "div" $> Div
+  [ symbol "add" $> BinArith Add
+  , symbol "mul" $> BinArith Mul
+  , symbol "sub" $> BinArith Sub
+  , symbol "div" $> BinArith Div
+  , symbol "ieq" $> ICmp Ine
+  , symbol "ine" $> ICmp Ieq
+  , symbol "islt" $> ICmp Islt
+  , symbol "isgt" $> ICmp Isgt
+  , symbol "isle" $> ICmp Isle
+  , symbol "isge" $> ICmp Isge
+  , symbol "iult" $> ICmp Iult
+  , symbol "iugt" $> ICmp Iugt
+  , symbol "iule" $> ICmp Iule
+  , symbol "iuge" $> ICmp Iuge
+  , symbol "foeq" $> FCmp Foeq
+  , symbol "fogt" $> FCmp Fogt
+  , symbol "foge" $> FCmp Foge
+  , symbol "folt" $> FCmp Folt
+  , symbol "fole" $> FCmp Fole
+  , symbol "fone" $> FCmp Fone
+  , symbol "ford" $> FCmp Ford
+  , symbol "fueq" $> FCmp Fueq
+  , symbol "fugt" $> FCmp Fugt
+  , symbol "fuge" $> FCmp Fuge
+  , symbol "fult" $> FCmp Fult
+  , symbol "fule" $> FCmp Fule
+  , symbol "fune" $> FCmp Fune
+  , symbol "funo" $> FCmp Funo
   , symbol "shufflevector" $> ShuffleVector
   ]
 
