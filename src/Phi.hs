@@ -595,18 +595,14 @@ infer = \case
 
 unfoldAggs :: Exp TyAnn -> Exp TyAnn
 unfoldAggs = go where
-  go = rewrite $ \ exp -> case exp of
+  go = transform $ \ exp -> case exp of
     Array{} -> goAgg exp
     Tuple{} -> goAgg exp
     Vector{} -> goAgg exp
-    _ -> Nothing
+    _ -> exp
   goAgg e = 
-    case goAgg' [] e `runState` [] of
-      (_, []) -> Nothing
-      (e', pes@(_:_)) ->
-        Just $ L.foldl'
-          (\ e (ss, e') -> Update (anno e) e (Path (reverse ss)) (go e'))
-          e' pes
+    let (e', pes) = goAgg' [] e `runState` [] in
+    L.foldl' (\ e (ss, e') -> Update (anno e) e (Path (reverse ss)) (go e')) e' pes
   goAgg' ss = \case
     Array a es -> Array a <$> goChildren IndexA es
     Tuple a s es -> Tuple a s <$> goChildren Proj es
