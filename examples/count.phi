@@ -1,0 +1,11 @@
+extern printf: fun (*i8, i32) -> void
+rec count(n: i32): {} =
+  rec go(i: i32): {} =
+    case islt(i, n) {
+      1 => let _: void = printf("%d", i) in go(add(i, 1)),
+      _ => {}
+    }
+  in go(0)
+in
+let _: {} = count(100) in
+0
