@@ -777,14 +777,9 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
 
 toTails :: ANF TyAnn -> ANF TailAnn
 toTails = fmap (hasTail .==. HasTail .*.) . go where
-  go = rewrite $ \case
-    ACall a x t f xs e
-      | checkTail x e -> Just $ ATail a x t f xs
-      | otherwise -> Nothing
-    _ -> Nothing
-  checkTail x = \case
-    AHalt (AVar _ x') | x == x' -> True
-    _ -> False
+  go = transform $ \case
+    ACall a x t f xs (AHalt (AVar _ x')) | x == x' -> ATail a x t f xs
+    e -> e
 
 -- -------------------- FV Annotation --------------------
 
