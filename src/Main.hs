@@ -10,10 +10,10 @@ print' :: (Functor f, Show (f ())) => f a -> IO ()
 print' x = print (x $> ())
 
 testTC :: String -> IO ()
-testTC s = either putStrLn print' $ (flip runTC M.empty . infer) =<< (ub <$> parse s)
+testTC s = either putStrLn print' $ (\ x -> runTC x M.empty M.empty) . infer =<< (ub <$> parse s)
 
 toANF' :: String -> Either String (ANF TyAnn)
-toANF' s = fmap (toANF . snd) . flip runTC M.empty . infer =<< (ub <$> parse s)
+toANF' s = fmap (toANF . snd) . (\ x -> runTC x M.empty M.empty) . infer =<< (ub <$> parse s)
 
 testANF :: String -> IO ()
 testANF s = either putStrLn print' (toANF' s)
@@ -204,10 +204,8 @@ tests = do
     , "in 0"
     ]
   either putStrLn putStrLn . compile $ unlines
-    [ "extern {"
-    , "  foo : fun (i32) -> *i8,"
-    , "  bar : fun (*i8) -> i32"
-    , "}"
+    [ "extern foo : fun (i32) -> *i8"
+    , "extern bar : fun (*i8) -> i32"
     , "bar(foo(0))"
     ]
   either putStrLn putStrLn . compile $ unlines
@@ -273,7 +271,7 @@ tests = do
     , "in 0"
     ]
   either putStrLn putStrLn . compile $ unlines
-    [ "extern {puts : fun (*i8) -> void}"
+    [ "extern puts : fun (*i8) -> void"
     , "let _: void = puts("
     , "  ref([104i8, 101i8, 108i8, 108i8, 111i8, 32i8, 119i8, 111i8, 114i8, 108i8, 100i8, 0i8]) as *i8)"
     , "in 0"
@@ -290,19 +288,19 @@ tests = do
     , "rec f(x: Z32): point = point{x, x} in 0"
     ]
   either putStrLn putStrLn . compile $ unlines
-    [ "extern {puts : fun (*i8) -> void}"
+    [ "extern puts : fun (*i8) -> void"
     , "let _: void = puts(\"hello world\")"
     , "in 0"
     ]
   either putStrLn putStrLn . compile $ unlines
     [ "struct cons{i32, *cons}"
     , "type list = *cons"
-    , "rec f(xs: *cons): i32 ="
+    , "rec f(xs: list): i32 ="
     , "  case xs as i64 {"
     , "    0 => 0,"
-    , "    _ => add(xs[0].0, f(xs[0].1)),"
+    , "    _ => add(xs[0].0, f(xs[0].1))"
     , "  }"
-    , "in f(ref({1, ref({2, ref({3, null : *cons})})}))"
+    , "in f(ref(cons{1, ref(cons{2, ref(cons{3, null : *cons})})}))"
     ]
 
 main = getArgs >>= \case

@@ -106,7 +106,7 @@ data Exp a
   | Int a Integer Width
   | Ann a (Exp a) Ty
   | Prim a Prim [Exp a]
-  | Coerce a (Exp a) Ty
+  | Cast a (Exp a) Ty
   | Let a Var Ty (Exp a) (Exp a)
   -- Control flow / name binding
   | Call a (Exp a) [Exp a]
@@ -186,7 +186,7 @@ anno = \case
   Int a _ _ -> a
   Ann a _ _ -> a
   Prim a _ _ -> a
-  Coerce a _ _ -> a
+  Cast a _ _ -> a
   Let a _ _ _ _ -> a
   Call a _ _ -> a
   Case a _ _ -> a
@@ -261,7 +261,7 @@ foldVars f = \case
   Int{} -> mempty
   Ann _ e _ -> go e
   Prim _ _ es -> foldMap go es
-  Coerce _ e _ -> go e
+  Cast _ e _ -> go e
   Let _ x _ e1 e -> f x <> go e1 <> go e
   Call _ e es -> go e <> foldMap go es
   Case _ e pes ->
@@ -307,7 +307,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
     Int a i w -> return $ Int a i w
     Ann a e ty -> Ann a <$> go σ e <*> pure ty
     Prim a p es -> Prim a p <$> mapM (go σ) es
-    Coerce a e t -> Coerce a <$> go σ e <*> pure t
+    Cast a e t -> Cast a <$> go σ e <*> pure t
     Let a x t e1 e -> do
       x' <- gen
       Let a x' t <$> go σ e1 <*> go (M.insert x x' σ) e
@@ -352,6 +352,7 @@ data TCErr
   | StructNotInScope String
   | ExGotShape String Ty
   | ExGot Ty Ty
+  | CantCast Ty Ty
   | OutOfBounds Word Ty
   | Custom String
 
@@ -363,6 +364,7 @@ instance PP TCErr where
     ExGotShape shape ty ->
       line' $ "Expected " <> fromString shape <> " but got " <> pp ty
     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
+    CantCast old new -> line' $ "Can't cast " <> pp old <> " to " <> pp new
     OutOfBounds n ty -> line' $ "Index " <> show'' n <> " is out of bounds for type " <> pp ty
     Custom s -> line' $ fromString s
 
@@ -375,12 +377,18 @@ makeLenses ''TCState
 
 type TC = ExceptT (P.SourcePos, TCErr) (Reader TCState)
 
-runTC' :: TC a -> Map Var Ty -> Map String Ty -> Either (P.SourcePos, TCErr) a
-runTC' m env extEnv =
-  runExceptT m `runReader` (TCState M.empty M.empty M.empty) {_tcExterns = extEnv}
+runTC' ::
+  TC a -> Map Var Ty -> Map String Ty -> Map String [Ty] ->
+  Either (P.SourcePos, TCErr) a
+runTC' m env extEnv structEnv =
+  runExceptT m `runReader` TCState
+    { _tcLocals = M.empty
+    , _tcExterns = extEnv
+    , _tcStructs = structEnv
+    }
 
-runTC :: TC a -> Map String Ty -> Either String a
-runTC m extEnv = first pretty $ runTC' m M.empty extEnv where
+runTC :: TC a -> Map String Ty -> Map String [Ty] -> Either String a
+runTC m extEnv structEnv = first pretty $ runTC' m M.empty extEnv structEnv where
   pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err)
 
 withBindings :: [Var] -> [Ty] -> TC a -> TC a
@@ -468,6 +476,11 @@ extVar a s = do
   ty <- extLookup a s
   return (ty, ExtVar (typ .==. ty .*. a) s)
 
+coercible :: UBAnn -> Ty -> Ty -> TC ()
+coercible a = curry $ \case
+  (PTy (Ptr _), PTy (Ptr _)) -> return ()
+  (old, new) -> raise a $ CantCast old new
+
 infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
 infer = \case
   Var a x -> var a x
@@ -481,9 +494,10 @@ infer = \case
   Prim a p es -> do
     (t, es') <- checkPrim a es p
     return (t, Prim (typ .==. t .*. a) p es')
-  Coerce a e ty -> do
-    (_, e') <- infer e
-    return (ty, Coerce (typ .==. ty .*. a) e' ty)
+  Cast a e ty -> do
+    (old, e') <- infer e
+    coercible a old ty
+    return (ty, Cast (typ .==. ty .*. a) e' ty)
   Let a x t e1 e -> do
     e1' <- check e1 t
     (ty, e') <- withBinding x t (infer e)
@@ -696,7 +710,7 @@ data ANF a
   = AHalt (Atom a)
   | AAlloca a Var Ty (Atom a) (ANF a)
   | APrim a Var Ty Prim [Atom a] (ANF a)
-  | ACoerce a Var Ty (Atom a) (ANF a)
+  | ACast a Var Ty (Atom a) (ANF a)
   -- Control flow / name binding
   | ACall a Var Ty (Atom a) [Atom a] (ANF a)
   | ATail a Var Ty (Atom a) [Atom a]
@@ -734,10 +748,10 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       x <- gen'
       push $ APrim a x (a^.typ) p es'
       return $ AVar a x
-    Coerce a e ty -> do
+    Cast a e ty -> do
       e' <- go σ e
       x <- gen'
-      push $ ACoerce a x ty e'
+      push $ ACast a x ty e'
       return $ AVar a x
     Let a x t e1 e -> do
       e1' <- go σ e1
@@ -839,7 +853,7 @@ aAnno = \case
   AHalt x -> atomAnno x
   AAlloca a _ _ _ _ -> a
   APrim a _ _ _ _ _  -> a
-  ACoerce a _ _ _ _ -> a
+  ACast a _ _ _ _ -> a
   ACall a _ _ _ _ _ -> a
   ATail a _ _ _ _ -> a
   ACase a _ _ -> a
@@ -895,8 +909,8 @@ annoFV = go where
       AAlloca (set (S.delete x (fvs e) ∪ atomFVs y) a) x t y e
     APrim a x t p (map goAtom -> xs) (go -> e) ->
       APrim (set (S.delete x (fvs e) ∪ foldMap atomFVs xs) a) x t p xs e
-    ACoerce a x t (goAtom -> y) (go -> e) ->
-      ACoerce (set (S.delete x (fvs e) ∪ atomFVs y) a) x t y e
+    ACast a x t (goAtom -> y) (go -> e) ->
+      ACast (set (S.delete x (fvs e) ∪ atomFVs y) a) x t y e
     ACall a x t (goAtom -> f) (map goAtom -> xs) (go -> e) ->
       ACall (set (S.delete x (fvs e) ∪ atomFVs f ∪ foldMap atomFVs xs) a) x t f xs e
     ATail a x t (goAtom -> f) (map goAtom -> xs) ->
@@ -962,8 +976,8 @@ annoBV = go where
       AAlloca (set (S.insert x (bvs e)) a) x t y e
     APrim a x t p (map goAtom -> xs) (go -> e) ->
       APrim (set (S.insert x (bvs e)) a) x t p xs e
-    ACoerce a x t (goAtom -> y) (go -> e) ->
-      ACoerce (set (S.insert x (bvs e)) a) x t y e
+    ACast a x t (goAtom -> y) (go -> e) ->
+      ACast (set (S.insert x (bvs e)) a) x t y e
     ACall a x t (goAtom -> f) (map goAtom -> xs) (go -> e) ->
       ACall (set (S.insert x (bvs e)) a) x t f xs e
     ATail a x t (goAtom -> f) (map goAtom -> xs) ->
@@ -988,7 +1002,7 @@ bvsOf = go M.empty where
     AHalt _ -> m
     AAlloca _ _ _ _ e -> go m e
     APrim _ _ _ _ _ e -> go m e
-    ACoerce _ _ _ _ e -> go m e
+    ACast _ _ _ _ e -> go m e
     ACall _ _ _ _ _ e -> go m e
     ATail{} -> m
     ACase _ _ xpes -> foldr (\ (x, (_, e)) m -> M.insert x (bvs e) (go m e)) m xpes
@@ -1015,7 +1029,7 @@ graphOf = go Nothing where
     AHalt _ -> M.empty
     AAlloca _ _ _ _ e -> go callerOf e
     APrim _ _ _ _ _ e -> go callerOf e
-    ACoerce _ _ _ _ e -> go callerOf e
+    ACast _ _ _ _ e -> go callerOf e
     ACall ((^. loc) -> locOf) x _ (AVar _ f) actualsOf e ->
       add f FnCall{locOf, isTail = False, callerOf, actualsOf} (go callerOf e)
     ACall _ _ _ _ _ e -> go callerOf e
@@ -1044,7 +1058,7 @@ initLive = go where
     AHalt _ -> M.empty
     AAlloca _ _ _ _ e -> go e
     APrim _ _ _ _ _ e -> go e
-    ACoerce _ _ _ _ e -> go e
+    ACast _ _ _ _ e -> go e
     ACall _ _ _ _ _ e -> go e
     ATail{} -> M.empty
     ACase _ _ xpes -> foldMap (\ (x, (_, e)) -> M.insert x (fvs e) (go e)) xpes
@@ -1154,12 +1168,13 @@ anfG graph bbs = go where
       _ -> do
         xs' <- commaSep <$> mapM opG xs
         ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
-    ACoerce a x t y e ->
+    ACast a x t y e ->
       case (t, atomAnno y ^. typ) of
         (t2@(PTy (Ptr _)), t1@(PTy (Ptr _))) -> do
           y' <- atomG y
           ret e =<< x .= ("bitcast " <> y' <> " to " <> pp t2)
-        (t2, t1) -> error $ "Unsupported coercion from " ++ show t1 ++ " to " ++ show t2
+        (t2, t1) ->
+          error $ "Unsupported coercion from " ++ show t1 ++ " to " ++ show t2
     ACall a x t f xs e -> do
       f' <- opG f
       xs' <- args xs
@@ -1335,7 +1350,7 @@ instance PP PTy where
     Half -> "half"
     Float -> "float"
     Double -> "double"
-    FP128 -> "FP128"
+    FP128 -> "fp128"
     Ptr t -> pp t <> "*"
 
 instance PP Ty where
@@ -1371,7 +1386,7 @@ instance PP (Exp a) where
     Int _ i w -> show'' i <> "i" <> show'' w
     Ann _ e ty -> pp e <> ": " <> pp ty
     Prim _ p es -> pp p <> "(" <> commaSep (map (indent . pp) es) <> ")"
-    Coerce _ e ty -> pp e <> " as " <> pp ty
+    Cast _ e ty -> pp e <> " as " <> pp ty
     Let _ x t e1 e -> F.fold
       [ line' $ "let " <> show'' x <> ": " <> pp t <> " = "
       , indent (pp e1)
@@ -1448,7 +1463,7 @@ instance PP (ANF a) where
     AHalt a -> line' $ "ret " <> pp a
     AAlloca _ x t y e -> bind x t ("alloca " <> pp y) e
     APrim _ x t p ys e -> bind x t (pp p <> "(" <> commaSep (map pp ys) <> ")") e
-    ACoerce _ x t y e -> bind x t ("coerce " <> pp y) e
+    ACast _ x t y e -> bind x t ("cast " <> pp y) e
     ACall _ x t f ys e -> bind x t (pp f <> "(" <> commaSep (map pp ys) <> ")") e
     ATail _ x t f ys ->
       line' $ "ret " <> show'' x <> ": " <> pp t <> " = "
@@ -1490,7 +1505,7 @@ data ParserState = ParserState
   , _pExtEnv :: Map String Ty -- Extern name -> type
   , _pTyAliases :: Map String Ty -- Type aliases
   , _pStructs :: Map String [Ty] -- Struct definitions
-  }
+  } deriving (THEUSUAL)
 
 makeLenses ''ParserState
 
@@ -1641,8 +1656,8 @@ armP = (:=>) <$> tryAll [Just <$> intP, symbol "_" $> Nothing] <* symbol "=>" <*
 
 externP :: Parser ()
 externP = do
-  xts <- concat <$> many (symbol "extern" >> braces (listOf ((,) <$> word <* symbol ":" <*> tyP)))
-  modify' $ pExtEnv %~ M.union (M.fromList xts)
+  (x, t) <- symbol "extern" >> (,) <$> word <* symbol ":" <*> tyP
+  modify' $ pExtEnv %~ M.insert x t
 
 aliasP :: Parser ()
 aliasP = do
@@ -1656,9 +1671,7 @@ structP = do
 
 expP' :: Bool -> Parser (Exp ParseAnn)
 expP' inGep = do
-  externP
-  many aliasP
-  many structP
+  many $ tryAll [externP, aliasP, structP]
   loc <- locP
   e <- tryAll
     [ Int loc <$> intP <*> (P.try (symbol "i" *> widthP) <|> pure 32)
@@ -1679,14 +1692,14 @@ expP' inGep = do
     , do
         bytes <- map (\ c -> Int loc (fromIntegral $ ord c) 8) <$> stringLiteral
         let cstr = bytes ++ [Int loc 0 8]
-        return $ Coerce loc (Alloca loc (Array loc cstr)) (PTy (Ptr (PTy (I 8))))
+        return $ Cast loc (Alloca loc (Array loc cstr)) (PTy (Ptr (PTy (I 8))))
     , parens expP
     , ExtVar loc <$> extVarP
     , Var loc <$> varP
     ]
   e <- tryAll
     [ symbol ":" >> Ann loc e <$> tyP
-    , symbol "as" >> Coerce loc e <$> tyP
+    , symbol "as" >> Cast loc e <$> tyP
     , Call loc e <$> tupleOf expP
     , if inGep then empty else do
         p <- pathP
@@ -1723,7 +1736,7 @@ compile :: String -> Either String String
 compile s = do
   let (r, pst) = parse' "" s
   e <- ub <$> r
-  e <- runTC (check e (PTy (I 32))) (pst^.pExtEnv)
+  e <- runTC (check e (PTy (I 32))) (pst^.pExtEnv) (pst^.pStructs)
   let anf = annoBV . annoFV . toTails . toANF $ unfoldAggs e
   let graph = graphOf anf
   let bvs = bvsOf anf
