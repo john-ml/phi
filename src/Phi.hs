@@ -62,8 +62,8 @@ data Ty
   = Void
   | PTy PTy
   | Arr Word Ty
-  | Tup (Maybe String) [Ty]
-  -- | TStruct String
+  | Tup [Ty]
+  | TStruct String
   | Vec Word PTy
   | FPtr [Ty] Ty
   deriving (THEUSUAL)
@@ -114,8 +114,8 @@ data Exp a
   | Rec a [Func a] (Exp a) -- Function bundle
   -- Aggregates
   | Array a [Exp a]
-  | Tuple a (Maybe String) [Exp a]
-  -- Struct a String [Exp a]
+  | Tuple a [Exp a]
+  | Struct a String [Exp a]
   | Vector a [Exp a]
   | Gep a (Exp a) (Path a) -- &e path (GEP)
   | Load a (Exp a) (Path a) -- e path (GEP+load, extractvalue, extractelement)
@@ -132,7 +132,8 @@ data Atom a
   | AExtVar a String
   | AInt a Integer Width
   | AArr a [Atom a]
-  | ATup a (Maybe String) [Atom a]
+  | ATup a [Atom a]
+  | AStruct a String [Atom a]
   | AVec a [Atom a]
   deriving (THEUSUALA)
 instance Data a => Plated (Atom a)
@@ -191,7 +192,8 @@ anno = \case
   Case a _ _ -> a
   Rec a _ _ -> a
   Array a _ -> a
-  Tuple a _ _ -> a
+  Tuple a _ -> a
+  Struct a _ _ -> a
   Vector a _ -> a
   Gep a _ _ -> a
   Load a _ _ -> a
@@ -268,7 +270,8 @@ foldVars f = \case
     goFunc (Func _ f' axts _ e) =
       f f' <> foldMap (\ (_, x, _) -> f x) axts <> go e
   Array _ es -> foldMap go es
-  Tuple _ _ es -> foldMap go es
+  Tuple _ es -> foldMap go es
+  Struct _ _ es -> foldMap go es
   Vector _ es -> foldMap go es
   Gep _ e (Path ss) -> go e <> foldMap goStep ss
   Load _ e (Path ss) -> go e <> foldMap goStep ss
@@ -325,7 +328,8 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
         Func a (σ' ! f) axts' t <$> go σ'' e
       Rec a helpers' <$> go σ' e
     Array a es -> Array a <$> mapM (go σ) es
-    Tuple a s es -> Tuple a s <$> mapM (go σ) es
+    Tuple a es -> Tuple a <$> mapM (go σ) es
+    Struct a s es -> Struct a s <$> mapM (go σ) es
     Vector a es -> Vector a <$> mapM (go σ) es
     Gep a e (Path ss) -> Gep a <$> go σ e <*> (Path <$> mapM goStep ss)
     Load a e (Path ss) -> Load a <$> go σ e <*> (Path <$> mapM goStep ss)
@@ -345,6 +349,7 @@ ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
 data TCErr
   = NotInScope Var
   | ExtNotInScope String
+  | StructNotInScope String
   | ExGotShape String Ty
   | ExGot Ty Ty
   | OutOfBounds Word Ty
@@ -354,6 +359,7 @@ instance PP TCErr where
   pp = \case
     NotInScope x -> line $ "Variable not in scope: " <> show' x
     ExtNotInScope s -> line $ "Extern variable not in scope: " <> fromString s
+    StructNotInScope s -> line $ "Unknown struct name: " <> fromString s
     ExGotShape shape ty ->
       line' $ "Expected " <> fromString shape <> " but got " <> pp ty
     ExGot ex got -> line' $ "Expected " <> pp ex <> " but got " <> pp got
@@ -392,6 +398,11 @@ extLookup :: UBAnn -> String -> TC Ty
 extLookup a s = (M.!? s) . _tcExterns <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ ExtNotInScope s
+
+structLookup :: UBAnn -> String -> TC [Ty]
+structLookup a s = (M.!? s) . _tcStructs <$> ask >>= \case
+  Just r -> return r
+  Nothing -> raise a $ StructNotInScope s
 
 check :: Exp UBAnn -> Ty -> TC (Exp TyAnn)
 check exp ty = case exp of
@@ -505,10 +516,14 @@ infer = \case
     es' <- mapM (`check` t) es
     let ty = Arr n t
     return (ty, Array (typ .==. ty .*. a) (e':es'))
-  Tuple a s es -> do
+  Tuple a es -> do
     (ts, es') <- unzip <$> mapM infer es
-    let ty = Tup s ts
-    return (ty, Tuple (typ .==. ty .*. a) s es')
+    let ty = Tup ts
+    return (ty, Tuple (typ .==. ty .*. a) es')
+  Struct a s es -> do
+    (ts, es') <- unzip <$> mapM infer es
+    let ty = TStruct s
+    return (ty, Struct (typ .==. ty .*. a) s es')
   Vector a [] -> raise a $ Custom "Zero-element vectors aren't allowed"
   Vector a ((e:es) :∧: (L.genericLength -> n)) -> infer e >>= \case
     (t@(PTy t'), e') -> do
@@ -529,7 +544,7 @@ infer = \case
       ss' <- okForGep a ss
       (ty, ss'') <- goPath True t ss'
       return (ty, Load (typ .==. ty .*. a) e' (Path ss''))
-    (t, e') | (case t of Tup _ _ -> True; Arr _ _ -> True; Vec _ _ -> True; _ -> False) -> do
+    (t, e') | isAgg t -> do
       (ty, ss') <- goPath False t ss
       return (ty, Load (typ .==. ty .*. a) e' (Path ss'))
     (t, anno -> a) -> raise a $ ExGotShape "one of {pointer, tuple, array, vector}" t
@@ -543,13 +558,19 @@ infer = \case
         return (ty, Store (typ .==. ty .*. a) dst' (Path ss'') src' e')
       (t, anno -> a) -> raise a $ ExGotShape "pointer" t
   Update a e (Path ss) e1 -> infer e >>= \case
-    (ty, e') | (case ty of Tup _ _ -> True; Arr _ _ -> True; Vec _ _ -> True; _ -> False) -> do
+    (ty, e') | isAgg ty -> do
       (t, ss') <- goPath False ty ss
       e1' <- check e1 t
       return (ty, Update (typ .==. ty .*. a) e' (Path ss') e1')
     (t, anno -> a) -> raise a $ ExGotShape "one of {tuple, array, vector}" t
   e -> raise (anno e) $ Custom "Can't infer the type of this expression"
   where
+    isAgg = \case
+      Tup _ -> True
+      TStruct _ -> True
+      Arr _ _ -> True
+      Vec _ _ -> True
+      _ -> False
     okForGep a = \case
       ss@(Index _ : _) -> return ss
       IndexA a n : ss' -> return (Index (Int a (fromIntegral n) 32) : ss')
@@ -557,12 +578,15 @@ infer = \case
     goPath' = goPath False
     goPath lax t = \case
       [] -> return (t, [])
-      Proj a n : ss -> case t of
-        Tup _ ts
+      path@(Proj a n : ss) -> case t of
+        Tup ts
           | n < L.genericLength ts -> do
               (t', ss') <- goPath' (ts `L.genericIndex` n) ss
               return (t', Proj (typ .==. Void .*. a) n : ss')
           | otherwise -> raise a $ OutOfBounds n t
+        TStruct s -> do
+          ts <- structLookup a s
+          goPath lax (Tup ts) path
         t -> raise a $ ExGotShape "tuple or struct" t
       Elem e : ss -> case t of
         Vec _ pt -> infer e >>= \case
@@ -619,6 +643,7 @@ unfoldAggs = go where
   go = transform $ \ exp -> case exp of
     Array{} -> goAgg exp
     Tuple{} -> goAgg exp
+    Struct{} -> goAgg exp
     Vector{} -> goAgg exp
     _ -> exp
   goAgg e = 
@@ -626,7 +651,8 @@ unfoldAggs = go where
     L.foldl' (\ e (ss, e') -> Update (anno e) e (Path (reverse ss)) (go e')) e' pes
   goAgg' ss = \case
     Array a es -> Array a <$> goChildren IndexA es
-    Tuple a s es -> Tuple a s <$> goChildren Proj es
+    Tuple a es -> Tuple a <$> goChildren Proj es
+    Struct a s es -> Struct a s <$> goChildren Proj es
     Vector a es -> do
       es' <- foriM es $ \ i e -> case e of
         Int{} -> return $ go e
@@ -641,12 +667,12 @@ unfoldAggs = go where
         foriM es $ \ i e -> let s = f (anno e) (fromIntegral i) in case e of
           Array{} -> goAgg' (s:ss) e
           Tuple{} -> goAgg' (s:ss) e
+          Struct{} -> goAgg' (s:ss) e
           Int{} -> return $ go e
           ExtVar{} -> return $ go e
           Undef{} -> return $ go e
           Null{} -> return $ go e
           e -> add (s:ss) e $> Undef (anno e)
-
 
 -- -------------------- Conversion to ANF --------------------
 
@@ -740,7 +766,8 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
       put' $ k . ARec a helpers' l
       go σ e
     Array a es -> do es' <- mapM (go σ) es; return $ AArr a es'
-    Tuple a s es -> do es' <- mapM (go σ) es; return $ ATup a s es'
+    Tuple a es -> do es' <- mapM (go σ) es; return $ ATup a es'
+    Struct a s es -> do es' <- mapM (go σ) es; return $ AStruct a s es'
     Vector a es -> do es' <- mapM (go σ) es; return $ AVec a es'
     Gep a e (Path ss) -> do
       (e', ss') <- goSteps e ss
@@ -796,7 +823,8 @@ atomAnno = \case
   AExtVar a _ -> a
   AInt a _ _ -> a
   AArr a _ -> a
-  ATup a _ _ -> a
+  ATup a _ -> a
+  AStruct a _ _ -> a
   AVec a _ -> a
 
 aStepAnno :: AStep a -> a
@@ -844,7 +872,8 @@ annoFV = go where
     AExtVar a s -> AExtVar (set S.empty a) s
     AInt a i w -> AInt (set S.empty a) i w
     AArr a (map goAtom -> xs) -> AArr (set (foldMap atomFVs xs) a) xs
-    ATup a s (map goAtom -> xs) -> ATup (set (foldMap atomFVs xs) a) s xs
+    ATup a (map goAtom -> xs) -> ATup (set (foldMap atomFVs xs) a) xs
+    AStruct a s (map goAtom -> xs) -> AStruct (set (foldMap atomFVs xs) a) s xs
     AVec a (map goAtom -> xs) -> AVec (set (foldMap atomFVs xs) a) xs
   goAFuncs :: [AFunc TailAnn] -> [AFunc FVAnn]
   goAFuncs fs = map goAFunc fs where
@@ -912,7 +941,8 @@ annoBV = go where
     AExtVar a s -> AExtVar (set S.empty a) s
     AInt a i w -> AInt (set S.empty a) i w
     AArr a (map goAtom -> xs) -> AArr (set S.empty a) xs
-    ATup a s (map goAtom -> xs) -> ATup (set S.empty a) s xs
+    ATup a (map goAtom -> xs) -> ATup (set S.empty a) xs
+    AStruct a s (map goAtom -> xs) -> AStruct (set S.empty a) s xs
     AVec a (map goAtom -> xs) -> AVec (set S.empty a) xs
   goAFuncs :: [AFunc FVAnn] -> [AFunc BVAnn]
   goAFuncs fs = map goAFunc fs where
@@ -1084,7 +1114,8 @@ anfG graph bbs = go where
     AExtVar a s -> return $ pp (a^.typ) <> " @" <> fromString s
     AInt _ i w -> return $ "i" <> show'' w <> " " <> show'' i
     AArr a xs -> agg a "[" "]" xs
-    ATup a s xs -> agg a "{" "}" xs
+    ATup a xs -> agg a "{" "}" xs
+    AStruct a s xs -> agg a "{" "}" xs
     AVec a xs -> agg a "<" ">" xs
   -- Like atomG, but omits the type annotation and can't do compound atoms
   opG = \case
@@ -1201,7 +1232,7 @@ anfG graph bbs = go where
         y' <- atomG y
         ss' <- gepPath ss
         ret e =<< x .= ("extractelement " <> y' <> ", " <> ss')
-      t | case t of Arr _ _ -> True; Tup _ _ -> True; _ -> False -> do
+      t | case t of Arr _ _ -> True; Tup _ -> True; TStruct _ -> True; _ -> False -> do
         y' <- atomG y
         let ss' = simplePath ss
         ret e =<< x .= ("extractvalue " <> y' <> ", " <> ss')
@@ -1225,7 +1256,7 @@ anfG graph bbs = go where
         ss' <- gepPath ss
         z' <- atomG z
         ret e =<< x .= ("insertelement " <> y' <> ", " <> z' <> ", " <> ss')
-      t | case t of Arr _ _ -> True; Tup _ _ -> True; _ -> False -> do
+      t | case t of Arr _ _ -> True; Tup _ -> True; TStruct _ -> True; _ -> False -> do
         y' <- atomG y
         let ss' = simplePath ss
         z' <- atomG z
@@ -1313,8 +1344,8 @@ instance PP Ty where
     PTy t -> pp t
     Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
     Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
-    Tup Nothing ts -> "{" <> commaSep (map pp ts) <> "}"
-    Tup (Just s) _ -> "%" <> fromString s
+    Tup ts -> "{" <> commaSep (map pp ts) <> "}"
+    TStruct s -> "%" <> fromString s
     FPtr ts t -> pp t <> "(" <> commaSep (map pp ts) <> ")*"
 
 instance PP Prim where
@@ -1374,9 +1405,8 @@ instance PP (Exp a) where
           , line' $ goFuncs "and " fs
           ]
     Array _ es -> "[" <> commaSep (map (indent . pp) es) <> "]"
-    Tuple _ s es ->
-      maybe "" ((<> " ") . fromString) s <>
-      "{" <> commaSep (map (indent . pp) es) <> "}"
+    Tuple _ es -> "{" <> commaSep (map (indent . pp) es) <> "}"
+    Struct _ s es -> "%" <> fromString s <> " {" <> commaSep (map (indent . pp) es) <> "}"
     Vector _ es -> "<" <> commaSep (map (indent . pp) es) <> ">"
     Gep _ e p -> "&" <> pp e <> pp p
     Load _ e p -> pp e <> pp p
@@ -1404,8 +1434,8 @@ instance PP (Atom a) where
     AExtVar _ s -> fromString s
     AInt _ i w -> show'' i <> "i" <> show'' w
     AArr _ xs -> "[" <> commaSep (map (indent . pp) xs) <> "]"
-    ATup _ Nothing xs -> "{" <> commaSep (map (indent . pp) xs) <> "}"
-    ATup _ (Just s) xs -> "%" <> fromString s
+    ATup _ xs -> "{" <> commaSep (map (indent . pp) xs) <> "}"
+    AStruct _ s xs -> "%" <> fromString s <> " {" <> commaSep (map (indent . pp) xs) <> "}"
     AVec _ xs -> "<" <> commaSep (map (indent . pp) xs) <> ">"
 
 instance PP (AFunc a) where
@@ -1563,11 +1593,12 @@ tyP = tryAll
   [ symbol "void" $> Void
   , angles $ Vec <$> wordP <* symbol "x" <*> ptyP
   , brackets $ Arr <$> wordP <* symbol "x" <*> tyP
-  , braces $ Tup Nothing <$> listOf tyP
+  , braces $ Tup <$> listOf tyP
   , symbol "fun" >> FPtr <$> tupleOf tyP <* symbol "->" <*> tyP
   , PTy <$> ptyP
   , parens tyP
   , tyAliasP
+  , TStruct <$> word
   ]
 
 widthP :: Parser Width = wordP
@@ -1621,7 +1652,6 @@ aliasP = do
 structP :: Parser ()
 structP = do
   (x, ts) <- symbol "struct" >> (,) <$> word <*> braces (listOf tyP)
-  modify' $ pTyAliases %~ M.insert x (Tup (Just x) ts)
   modify' $ pStructs %~ M.insert x ts
 
 expP' :: Bool -> Parser (Exp ParseAnn)
@@ -1641,8 +1671,8 @@ expP' inGep = do
     , symbol "case" >> Case loc <$> expP <*> braces (listOf armP)
     , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
     , symbol "[" >> Array loc <$> listOf expP <* symbol "]"
-    , symbol "{" >> Tuple loc Nothing <$> listOf expP <* symbol "}"
-    , Tuple loc . Just <$> word <* symbol "{" <*> listOf expP <* symbol "}"
+    , symbol "{" >> Tuple loc <$> listOf expP <* symbol "}"
+    , Struct loc <$> word <*> braces (listOf expP)
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
     , symbol "&" >> Gep loc <$> expP' True <*> pathP
     , symbol "ref" >> Alloca loc <$> parens expP
