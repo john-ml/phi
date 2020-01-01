@@ -1,5 +1,7 @@
 Preprocessing executable 'phi-exe' for phi-0.1.0.0..
 Building executable 'phi-exe' for phi-0.1.0.0..
+[2 of 3] Compiling Phi              ( src/Phi.hs, dist/build/phi-exe/phi-exe-tmp/Phi.o )
+Linking dist/build/phi-exe/phi-exe ...
 Running phi-exe...
 Int () 3 32
 Let () 0 (PTy (I 32)) (Int () 3 32) (Int () 4 32)
@@ -569,5 +571,38 @@ define i32 @main() {
   call void @puts(i8* %x3)
   ret i32 0
 }
-4:8: 
-Can't cast %cons* to i64
+
+%cons = type {i32, %cons*}
+define i32 @f2(%cons* %x3) {
+  %x4 = icmp eq %cons* %x3, null
+  switch i1 %x4, label %fallback1 [
+    i1 1, label %x5
+    i1 0, label %x10
+  ]
+x5:
+  ret i32 0
+x10:
+  %ptr2 = getelementptr %cons, %cons* %x3, i32 0, i32 0
+  %x6 = load i32, i32* %ptr2
+  %ptr3 = getelementptr %cons, %cons* %x3, i32 0, i32 1
+  %x7 = load %cons*, %cons** %ptr3
+  %x8 = call i32 @f2(%cons* %x7)
+  %x9 = add i32 %x6, %x8
+  ret i32 %x9
+fallback1:
+  unreachable
+}
+define i32 @main() {
+  br label %x11
+x11:
+  %x12 = alloca %cons
+  store %cons {i32 3, %cons* null}, %cons* %x12
+  %x13 = insertvalue %cons {i32 2, %cons* undef}, %cons* %x12, 1
+  %x14 = alloca %cons
+  store %cons %x13, %cons* %x14
+  %x15 = insertvalue %cons {i32 1, %cons* undef}, %cons* %x14, 1
+  %x16 = alloca %cons
+  store %cons %x15, %cons* %x16
+  %x17 = tail call i32 @f2(%cons* %x16)
+  ret i32 %x17
+}

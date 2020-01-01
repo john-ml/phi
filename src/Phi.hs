@@ -456,7 +456,7 @@ checkCmp a es ok = case es of
     (t, e1') <- infer e1
     unless (ok t) . raise a $ ExGotShape "one of {numeric type, pointer, <_ x numeric type>}" t
     e2' <- check e2 t
-    return (t, [e1', e2'])
+    return (PTy (I 1), [e1', e2'])
 
 checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
 checkPrim a es = \case
@@ -1191,7 +1191,8 @@ anfG graph bbs = go where
         ret e =<< x .= (pp p <> " " <> xs')
       _ -> do
         xs' <- commaSep <$> mapM opG xs
-        ret e =<< x .= (pp p <> " " <> pp t <> " " <> xs')
+        let ty = case xs of [] -> t; x:_ -> atomAnno x ^. typ
+        ret e =<< x .= (pp p <> " " <> pp ty <> " " <> xs')
     ACast a x t y e ->
       case (t, atomAnno y ^. typ) of
         (t2@(PTy (Ptr _)), t1@(PTy (Ptr _))) -> do
@@ -1652,8 +1653,8 @@ primP = tryAll
   , symbol "mul" $> BinArith Mul
   , symbol "sub" $> BinArith Sub
   , symbol "div" $> BinArith Div
-  , symbol "ieq" $> ICmp Ine
-  , symbol "ine" $> ICmp Ieq
+  , symbol "ieq" $> ICmp Ieq
+  , symbol "ine" $> ICmp Ine
   , symbol "islt" $> ICmp Islt
   , symbol "isgt" $> ICmp Isgt
   , symbol "isle" $> ICmp Isle
