@@ -1,7 +1,6 @@
 Preprocessing executable 'phi-exe' for phi-0.1.0.0..
 Building executable 'phi-exe' for phi-0.1.0.0..
 [2 of 3] Compiling Phi              ( src/Phi.hs, dist/build/phi-exe/phi-exe-tmp/Phi.o )
-[3 of 3] Compiling Main             ( src/Main.hs, dist/build/phi-exe/phi-exe-tmp/Main.o ) [Phi changed]
 Linking dist/build/phi-exe/phi-exe ...
 Running phi-exe...
 Int () 3 32
@@ -559,5 +558,14 @@ define %point @f2(i32 %x3) {
 define i32 @main() {
   br label %x6
 x6:
+  ret i32 0
+}
+
+declare void @puts(i8*) nounwind
+define i32 @main() {
+  %x2 = alloca [12 x i8]
+  store [12 x i8] [i8 104, i8 101, i8 108, i8 108, i8 111, i8 32, i8 119, i8 111, i8 114, i8 108, i8 100, i8 0], [12 x i8]* %x2
+  %x3 = bitcast [12 x i8]* %x2 to i8*
+  call void @puts(i8* %x3)
   ret i32 0
 }

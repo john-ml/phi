@@ -1512,6 +1512,9 @@ listOf p = p `P.sepBy` symbol ","
 tupleOf :: Parser a -> Parser [a]
 tupleOf = parens . listOf
 
+stringLiteral :: Parser String
+stringLiteral = char '\"' *> P.manyTill L.charLiteral (char '\"')
+
 -- -------------------- Parsing --------------------
 
 keywords :: [String]
@@ -1652,6 +1655,10 @@ expP' inGep = do
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
     , symbol "&" >> Gep loc <$> expP' True <*> pathP
     , symbol "ref" >> Alloca loc <$> parens expP
+    , do
+        bytes <- map (\ c -> Int loc (fromIntegral $ ord c) 8) <$> stringLiteral
+        let cstr = bytes ++ [Int loc 0 8]
+        return $ Coerce loc (Alloca loc (Array loc cstr)) (PTy (Ptr (PTy (I 8))))
     , parens expP
     , ExtVar loc <$> extVarP
     , Var loc <$> varP
@@ -1669,11 +1676,11 @@ expP' inGep = do
     , pure e
     ]
   tryAll
-    [ symbol "with" >> updates loc e <$> braces (listOf ((,) <$> pathP <* symbol "=" <*> expP))
+    [ symbol "with" >>
+        L.foldl' (\ e (p, e1) -> Update loc e p e1) e
+          <$> braces (listOf ((,) <$> pathP <* symbol "=" <*> expP))
     , pure e
     ]
-  where
-    updates loc = L.foldl' (\ e (p, e1) -> Update loc e p e1)
 
 expP :: Parser (Exp ParseAnn)
 expP = expP' False

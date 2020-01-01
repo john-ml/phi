@@ -289,6 +289,11 @@ tests = do
     , "struct point {Z32, i32}"
     , "rec f(x: Z32): point = point {x, x} in 0"
     ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "extern {puts : fun (*i8) -> void}"
+    , "let _: void = puts(\"hello world\")"
+    , "in 0"
+    ]
 
 main = getArgs >>= \case
   ["test"] -> tests
