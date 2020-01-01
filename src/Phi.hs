@@ -777,21 +777,11 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
 
 toTails :: ANF TyAnn -> ANF TailAnn
 toTails = fmap (hasTail .==. HasTail .*.) . go where
-  go exp = case exp of
-    AHalt _ -> exp
-    AAlloca a x t y e -> AAlloca a x t y (go e)
-    APrim a x t p xs e -> APrim a x t p xs (go e)
-    ACoerce a x t y e -> ACoerce a x t y (go e)
+  go = rewrite $ \case
     ACall a x t f xs e
-      | checkTail x e -> ATail a x t f xs
-      | otherwise -> ACall a x t f xs (go e)
-    ACase a x xpes -> ACase a x (map (fmap (fmap go)) xpes)
-    ARec a fs l e -> ARec a (map goAFunc fs) l (go e)
-    AGep a x t y p e -> AGep a x t y p (go e)
-    ALoad a x t y p e -> ALoad a x t y p (go e)
-    AStore a d p s e -> AStore a d p s (go e)
-    AUpdate a x t y p z e -> AUpdate a x t y p z (go e)
-  goAFunc (AFunc a f axts t e) = AFunc a f axts t (go e)
+      | checkTail x e -> Just $ ATail a x t f xs
+      | otherwise -> Nothing
+    _ -> Nothing
   checkTail x = \case
     AHalt (AVar _ x') | x == x' -> True
     _ -> False
