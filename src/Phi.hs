@@ -1281,16 +1281,18 @@ anfG graph bbs = go where
           ]
         return mempty
 
-mainG :: Map String Ty -> CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
-mainG extEnv graph bbs e =
+mainG :: Map String Ty -> Map String [Ty] -> CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
+mainG extEnv structs graph bbs e =
   let
     (body, globals) = runWriterT (anfG graph bbs e)
       `runReaderT` (([], PTy (I 32)), S.empty)
       `evalState` 0
     extDecls = foldMap mkDecl (M.toList extEnv)
   in
-  globals <> F.fold
+  F.fold
     [ foldMap (line' . mkDecl) (M.toList extEnv)
+    , foldMap (line' . mkStruct) (M.toList structs)
+    , globals
     , line' "define i32 @main() {"
     , body
     , line' "}"
@@ -1301,6 +1303,7 @@ mainG extEnv graph bbs e =
         "declare " <> pp t <> " @" <> fromString f <>
         "(" <> commaSep (map pp ts) <> ") nounwind"
       (x, t) -> error $ "Unsupported extern type: " ++ runDoc (pp t)
+    mkStruct (x, ts) = "%" <> fromString x <> " = type {" <> commaSep (map pp ts) <> "}"
 
 -- -------------------- Pretty printers --------------------
 
@@ -1320,7 +1323,7 @@ instance PP Ty where
     Vec n t -> "<" <> show'' n <> " x " <> pp t <> ">"
     Arr n t -> "[" <> show'' n <> " x " <> pp t <> "]"
     Tup Nothing ts -> "{" <> commaSep (map pp ts) <> "}"
-    Tup (Just s) _ -> fromString s
+    Tup (Just s) _ -> "%" <> fromString s
     FPtr ts t -> pp t <> "(" <> commaSep (map pp ts) <> ")*"
 
 instance PP Prim where
@@ -1465,7 +1468,7 @@ data ParserState = ParserState
   { _pNames :: Map String Word -- Name -> internal id
   , _pExtEnv :: Map String Ty -- Extern name -> type
   , _pTyAliases :: Map String Ty -- Type aliases
-  , _pTyDefs :: Map String Ty -- Type definitions
+  , _pStructs :: Map String [Ty] -- Struct definitions
   }
 
 makeLenses ''ParserState
@@ -1621,10 +1624,17 @@ aliasP = do
   (x, t) <- symbol "type" >> (,) <$> word <* symbol "=" <*> tyP
   modify' $ pTyAliases %~ M.insert x t
 
+structP :: Parser ()
+structP = do
+  (x, ts) <- symbol "struct" >> (,) <$> word <*> braces (listOf tyP)
+  modify' $ pTyAliases %~ M.insert x (Tup (Just x) ts)
+  modify' $ pStructs %~ M.insert x ts
+
 expP' :: Bool -> Parser (Exp ParseAnn)
 expP' inGep = do
   externP
   many aliasP
+  many structP
   loc <- locP
   e <- tryAll
     [ Int loc <$> intP <*> (P.try (symbol "i" *> widthP) <|> pure 32)
@@ -1638,6 +1648,7 @@ expP' inGep = do
     , symbol "rec" >> Rec loc <$> (funcP `P.sepBy` symbol "and") <* symbol "in" <*> expP
     , symbol "[" >> Array loc <$> listOf expP <* symbol "]"
     , symbol "{" >> Tuple loc Nothing <$> listOf expP <* symbol "}"
+    , Tuple loc . Just <$> word <* symbol "{" <*> listOf expP <* symbol "}"
     , symbol "<" >> Vector loc <$> listOf expP <* symbol ">"
     , symbol "&" >> Gep loc <$> expP' True <*> pathP
     , symbol "ref" >> Alloca loc <$> parens expP
@@ -1691,7 +1702,7 @@ compile s = do
   let l = liveness bvs graph anf
   let bbs = inferBBs l
   first show $ checkBBs graph bbs
-  return . runDoc $ mainG (pst^.pExtEnv) graph bbs anf
+  return . runDoc $ mainG (pst^.pExtEnv) (pst^.pStructs) graph bbs anf
 
 compileFile :: FilePath -> IO (Either String String)
 compileFile f = compile <$> readFile f

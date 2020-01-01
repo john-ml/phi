@@ -1,5 +1,8 @@
 Preprocessing executable 'phi-exe' for phi-0.1.0.0..
 Building executable 'phi-exe' for phi-0.1.0.0..
+[2 of 3] Compiling Phi              ( src/Phi.hs, dist/build/phi-exe/phi-exe-tmp/Phi.o )
+[3 of 3] Compiling Main             ( src/Main.hs, dist/build/phi-exe/phi-exe-tmp/Main.o ) [Phi changed]
+Linking dist/build/phi-exe/phi-exe ...
 Running phi-exe...
 Int () 3 32
 Let () 0 (PTy (I 32)) (Int () 3 32) (Int () 4 32)
@@ -529,6 +532,29 @@ define {i32, i32} @f2(i32 %x3) {
   %x4 = insertvalue {i32, i32} {i32 undef, i32 undef}, i32 %x3, 1
   %x5 = insertvalue {i32, i32} %x4, i32 %x3, 0
   ret {i32, i32} %x5
+}
+define i32 @main() {
+  br label %x6
+x6:
+  ret i32 0
+}
+
+define {i32, i32} @f2(i32 %x3) {
+  %x4 = insertvalue {i32, i32} {i32 undef, i32 undef}, i32 %x3, 1
+  %x5 = insertvalue {i32, i32} %x4, i32 %x3, 0
+  ret {i32, i32} %x5
+}
+define i32 @main() {
+  br label %x6
+x6:
+  ret i32 0
+}
+
+%point = type {i32, i32}
+define %point @f2(i32 %x3) {
+  %x4 = insertvalue %point {i32 undef, i32 undef}, i32 %x3, 1
+  %x5 = insertvalue %point %x4, i32 %x3, 0
+  ret %point %x5
 }
 define i32 @main() {
   br label %x6

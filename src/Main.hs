@@ -284,6 +284,11 @@ tests = do
     , "type pi32 = {Z32, i32}"
     , "rec f(x: Z32): pi32 = {x, x} in 0"
     ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "type Z32 = i32"
+    , "struct point {Z32, i32}"
+    , "rec f(x: Z32): point = point {x, x} in 0"
+    ]
 
 main = getArgs >>= \case
   ["test"] -> tests
