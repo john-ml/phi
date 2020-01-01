@@ -1508,7 +1508,7 @@ tupleOf = parens . listOf
 -- -------------------- Parsing --------------------
 
 keywords :: [String]
-keywords = ["rec", "and", "in", "case", "as", "extern", "with"]
+keywords = ["rec", "and", "in", "case", "as", "extern", "with", "type", "struct"]
 
 word :: Parser String
 word = do
@@ -1532,6 +1532,14 @@ extVarP = do
   exts <- _pExtEnv <$> get
   guard $ x `M.member` exts
   return x
+
+tyAliasP :: Parser Ty
+tyAliasP = do
+  x <- word
+  aliases <- _pTyAliases <$> get
+  case aliases M.!? x of
+    Just t -> return t
+    Nothing -> empty
 
 wordP :: Parser Word = read <$> lexeme (P.takeWhile1P (Just "digit") isDigit)
 
@@ -1558,6 +1566,7 @@ tyP = tryAll
   , symbol "fun" >> FPtr <$> tupleOf tyP <* symbol "->" <*> tyP
   , PTy <$> ptyP
   , parens tyP
+  , tyAliasP
   ]
 
 widthP :: Parser Width = wordP
@@ -1603,9 +1612,15 @@ externP = do
   xts <- concat <$> many (symbol "extern" >> braces (listOf ((,) <$> word <* symbol ":" <*> tyP)))
   modify' $ pExtEnv %~ M.union (M.fromList xts)
 
+aliasP :: Parser ()
+aliasP = do
+  (x, t) <- symbol "type" >> (,) <$> word <* symbol "=" <*> tyP
+  modify' $ pTyAliases %~ M.insert x t
+
 expP' :: Bool -> Parser (Exp ParseAnn)
 expP' inGep = do
   externP
+  many aliasP
   loc <- locP
   e <- tryAll
     [ Int loc <$> intP <*> (P.try (symbol "i" *> widthP) <|> pure 32)

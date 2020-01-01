@@ -279,6 +279,11 @@ tests = do
     , "in 0"
     ]
   either putStrLn putStrLn . compile $ "rec f(x: i32): {i32, i32} = {x, x} in 0"
+  either putStrLn putStrLn . compile $ unlines
+    [ "type Z32 = i32"
+    , "type pi32 = {Z32, i32}"
+    , "rec f(x: Z32): pi32 = {x, x} in 0"
+    ]
 
 main = getArgs >>= \case
   ["test"] -> tests
