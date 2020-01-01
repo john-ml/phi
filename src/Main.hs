@@ -286,13 +286,23 @@ tests = do
     ]
   either putStrLn putStrLn . compile $ unlines
     [ "type Z32 = i32"
-    , "struct point {Z32, i32}"
-    , "rec f(x: Z32): point = point {x, x} in 0"
+    , "struct point{Z32, i32}"
+    , "rec f(x: Z32): point = point{x, x} in 0"
     ]
   either putStrLn putStrLn . compile $ unlines
     [ "extern {puts : fun (*i8) -> void}"
     , "let _: void = puts(\"hello world\")"
     , "in 0"
+    ]
+  either putStrLn putStrLn . compile $ unlines
+    [ "struct cons{i32, *cons}"
+    , "type list = *cons"
+    , "rec f(xs: *cons): i32 ="
+    , "  case xs as i64 {"
+    , "    0 => 0,"
+    , "    _ => add(xs[0].0, f(xs[0].1)),"
+    , "  }"
+    , "in f(ref({1, ref({2, ref({3, null : *cons})})}))"
     ]
 
 main = getArgs >>= \case
