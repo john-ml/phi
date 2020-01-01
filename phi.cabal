@@ -23,4 +23,5 @@ executable phi-exe
       FlexibleContexts, TupleSections, OverloadedStrings,
       TypeSynonymInstances, FlexibleInstances, StandaloneDeriving,
       MultiParamTypeClasses, FunctionalDependencies, DataKinds, GADTs, PolyKinds,
-      PartialTypeSignatures, NoMonomorphismRestriction, CPP, NamedFieldPuns
+      PartialTypeSignatures, NoMonomorphismRestriction, CPP, NamedFieldPuns,
+      DeriveDataTypeable

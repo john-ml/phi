@@ -1,7 +1,5 @@
 Preprocessing executable 'phi-exe' for phi-0.1.0.0..
 Building executable 'phi-exe' for phi-0.1.0.0..
-[2 of 3] Compiling Phi              ( src/Phi.hs, dist/build/phi-exe/phi-exe-tmp/Phi.o )
-Linking dist/build/phi-exe/phi-exe ...
 Running phi-exe...
 Int () 3 32
 Let () 0 (PTy (I 32)) (Int () 3 32) (Int () 4 32)
@@ -212,26 +210,28 @@ x5:
 }
 
 define i32 @f2({i64, {i32, i64}, {<2 x i32>, i32}} %x3) {
-  %x4 = insertvalue {i64, {i32, i64}, {<2 x i32>, i32}} {i64 0, {i32, i64} {i32 1, i64 2}, {<2 x i32>, i32} {<2 x i32> undef, i32 5}}, <2 x i32> <i32 3, i32 4>, 2, 0
-  %x5 = musttail call i32 @f2({i64, {i32, i64}, {<2 x i32>, i32}} %x4)
-  ret i32 %x5
+  %x4 = insertvalue {<2 x i32>, i32} {<2 x i32> undef, i32 5}, <2 x i32> <i32 3, i32 4>, 0
+  %x5 = insertvalue {i64, {i32, i64}, {<2 x i32>, i32}} {i64 0, {i32, i64} {i32 1, i64 2}, {<2 x i32>, i32} undef}, {<2 x i32>, i32} %x4, 2
+  %x6 = musttail call i32 @f2({i64, {i32, i64}, {<2 x i32>, i32}} %x5)
+  ret i32 %x6
 }
 define i32 @main() {
-  br label %x6
-x6:
+  br label %x7
+x7:
   ret i32 0
 }
 2:5: 
 Expected {i64, {i32, i64}, {<2 x i32>, i32}} but got {i64, {i32, i64}, {<2 x i32>, i33}}
 
 define i32 @f3({i64, {i32, i64}, {<2 x i32>, i32}} %x4) {
-  %x6 = insertvalue {i64, {i32, i64}, {<2 x i32>, i32}} {i64 0, {i32, i64} {i32 1, i64 2}, {<2 x i32>, i32} {<2 x i32> undef, i32 5}}, <2 x i32> <i32 3, i32 4>, 2, 0
-  %x7 = musttail call i32 @f3({i64, {i32, i64}, {<2 x i32>, i32}} %x6)
-  ret i32 %x7
+  %x6 = insertvalue {<2 x i32>, i32} {<2 x i32> undef, i32 5}, <2 x i32> <i32 3, i32 4>, 0
+  %x7 = insertvalue {i64, {i32, i64}, {<2 x i32>, i32}} {i64 0, {i32, i64} {i32 1, i64 2}, {<2 x i32>, i32} undef}, {<2 x i32>, i32} %x6, 2
+  %x8 = musttail call i32 @f3({i64, {i32, i64}, {<2 x i32>, i32}} %x7)
+  ret i32 %x8
 }
 define i32 @main() {
-  br label %x8
-x8:
+  br label %x9
+x9:
   ret i32 0
 }
 
@@ -569,3 +569,9 @@ define i32 @main() {
   call void @puts(i8* %x3)
   ret i32 0
 }
+1:23:
+  |
+1 | struct cons{i32, *cons}
+  |                       ^
+expecting '_' or alphanumeric character
+

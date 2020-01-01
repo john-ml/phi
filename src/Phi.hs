@@ -32,9 +32,13 @@ import qualified Data.Graph as G
 import Util
 
 import Data.HList.CommonMain hiding (Any)
+
+import Data.Data
+import Data.Data.Lens
 import Control.Lens
 
-#define THEUSUAL Eq, Ord, Show, Functor, Foldable, Traversable
+#define THEUSUAL Eq, Ord, Show, Data
+#define THEUSUALA Eq, Ord, Show, Functor, Foldable, Traversable, Data
 
 -- -------------------- Object language --------------------
 
@@ -42,14 +46,16 @@ import Control.Lens
 data Prim
   = Add | Sub | Mul | Div
   | ShuffleVector
-  deriving (Eq, Ord, Show)
+  deriving (THEUSUAL)
+instance Plated Prim
 
 -- Primitive types
 data PTy
   = I Word
   | Half | Float | Double | FP128
   | Ptr Ty
-  deriving (Eq, Ord, Show)
+  deriving (THEUSUAL)
+instance Plated PTy
 
 -- Types
 data Ty
@@ -59,7 +65,8 @@ data Ty
   | Tup (Maybe String) [Ty] -- Possibly nominal
   | Vec Word PTy
   | FPtr [Ty] Ty
-  deriving (Eq, Ord, Show)
+  deriving (THEUSUAL)
+instance Plated Ty
 
 -- LLVM has 3 ways of reading substructures:
 -- - extractvalue: works on structs or arrays with constant offset
@@ -68,22 +75,26 @@ data Ty
 -- LLVM's version of C's a[i] is gep + load.
 
 -- Access paths
-newtype Path a = Path [Step a] deriving (THEUSUAL)
+newtype Path a = Path [Step a] deriving (THEUSUALA)
 data Step a
   = Proj a Word -- extractvalue struct: e.n, n const
   | Elem (Exp a) -- extractelement: e<e>
   | IndexA a Word -- extractvalue array: e[n], n const
   | Index (Exp a) -- array offset: e[e] (e non-const)
-  deriving (THEUSUAL)
+  deriving (THEUSUALA)
 
 type Var = Word
 type Width = Word
 
 -- Local function definition
-data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (THEUSUAL)
+data Func a = Func a Var [(a, Var, Ty)] Ty (Exp a) deriving (THEUSUALA)
+instance Data a => Plated (Func a)
+
+-- Case arms
+data Arm a = Maybe Integer :=> Exp a deriving (THEUSUALA)
+instance Data a => Plated (Arm a)
 
 -- Expressions
-data Arm a = Maybe Integer :=> Exp a deriving (THEUSUAL)
 data Exp a
   -- Primitives
   = Var a Var
@@ -108,7 +119,8 @@ data Exp a
   | Load a (Exp a) (Path a) -- e path (GEP+load, extractvalue, extractelement)
   | Store a (Exp a) (Path a) (Exp a) (Exp a) -- e path <- e; e (GEP+store)
   | Update a (Exp a) (Path a) (Exp a) -- e with path = e (insertvalue, insertelement)
-  deriving (THEUSUAL)
+  deriving (THEUSUALA)
+instance Data a => Plated (Exp a)
 
 -- Since this is LLVM and not λ-calculus, every function must satisfy some conditions
 -- so that they can be implemented as basic blocks using φ-nodes instead of closures.
@@ -180,7 +192,7 @@ type ParseFields = '[Tagged "loc" P.SourcePos]
 type ParseAnn = Record ParseFields
 
 -- After parsing, make bindings unique
-data HasUB = HasUB deriving (Eq, Ord, Show)
+data HasUB = HasUB deriving (THEUSUAL)
 type UBFields = Tagged "hasUB" HasUB : ParseFields
 type UBAnn = Record UBFields
 
@@ -193,7 +205,7 @@ typeof :: Exp TyAnn -> Ty
 typeof e = anno e ^. typ
 
 -- After TC, convert to ANF and rewrite tail calls into Tail AST nodes.
-data HasTail = HasTail deriving (Eq, Ord, Show)
+data HasTail = HasTail deriving (THEUSUAL)
 type TailFields = Tagged "hasTail" HasTail : TyFields
 type TailAnn = Record TailFields
 
@@ -209,7 +221,7 @@ data FnCall a = FnCall
   , callerOf :: Maybe Var -- Nothing ==> main
   , actualsOf :: [Atom a]
   , locOf :: P.SourcePos
-  } deriving (THEUSUAL)
+  } deriving (THEUSUALA)
 type CallGraph a = Map Var (Set (FnCall a))
 
 -- ...and determine whether each function should be an SSA block or a CFG.
@@ -583,37 +595,18 @@ infer = \case
 
 unfoldAggs :: Exp TyAnn -> Exp TyAnn
 unfoldAggs = go where
-  go exp = case exp of
-    Var{} -> exp
-    Undef{} -> exp
-    Null{} -> exp
-    ExtVar{} -> exp
-    Alloca a e -> Alloca a (go e)
-    Int{} -> exp
-    Ann a e ty -> Ann a (go e) ty
-    Prim a p es -> Prim a p (go <$> es)
-    Coerce a e t -> Coerce a (go e) t
-    Let a x t e1 e -> Let a x t (go e1) (go e)
-    Call a e es -> Call a (go e) (go <$> es)
-    Case a e pes -> Case a (go e) (for pes $ \ (p :=> e) -> p :=> go e)
-    Rec a helpers e ->
-      Rec a (for helpers $ \ (Func a f xts t e) -> Func a f xts t (go e)) (go e)
+  go = rewrite $ \ exp -> case exp of
     Array{} -> goAgg exp
     Tuple{} -> goAgg exp
     Vector{} -> goAgg exp
-    Gep a e p -> Gep a (go e) (goPath p)
-    Load a e p -> Load a (go e) (goPath p)
-    Store a dst p src e -> Store a (go dst) (goPath p) (go src) (go e)
-    Update a e p e1 -> Update a (go e) (goPath p) (go e1)
-  goPath (Path ss) = Path (goStep <$> ss)
-  goStep s = case s of
-    Proj{} -> s
-    IndexA{} -> s
-    Elem e -> Elem (go e)
-    Index e -> Index (go e)
+    _ -> Nothing
   goAgg e = 
-    let (e', pes) = goAgg' [] e `runState` [] in
-    L.foldl' (\ e (ss, e') -> Update (anno e) e (Path (reverse ss)) (go e')) e' pes
+    case goAgg' [] e `runState` [] of
+      (_, []) -> Nothing
+      (e', pes@(_:_)) ->
+        Just $ L.foldl'
+          (\ e (ss, e') -> Update (anno e) e (Path (reverse ss)) (go e'))
+          e' pes
   goAgg' ss = \case
     Array a es -> Array a <$> goChildren IndexA es
     Tuple a s es -> Tuple a s <$> goChildren Proj es
@@ -637,6 +630,7 @@ unfoldAggs = go where
           Null{} -> return $ go e
           e -> add (s:ss) e $> Undef (anno e)
 
+
 -- -------------------- Conversion to ANF --------------------
 
 data Atom a
@@ -648,19 +642,25 @@ data Atom a
   | AArr a [Atom a]
   | ATup a (Maybe String) [Atom a]
   | AVec a [Atom a]
-  deriving (THEUSUAL)
+  deriving (THEUSUALA)
+instance Data a => Plated (Atom a)
 
-newtype APath a = APath [AStep a] deriving (THEUSUAL)
+newtype APath a = APath [AStep a] deriving (THEUSUALA)
+instance Data a => Plated (APath a)
+
 data AStep a
   = AProj a Word -- extractvalue struct: e.n, n const
   | AElem (Atom a) -- extractelement: e<e>
   | AIndexA a Word -- extractvalue array: e.[n], n const
   | AIndex (Atom a) -- gep offset: e[e]
-  deriving (THEUSUAL)
+  deriving (THEUSUALA)
+instance Data a => Plated (AStep a)
+
+data AFunc a = AFunc a Var [(a, Var, Ty)] Ty (ANF a) deriving (THEUSUALA)
+instance Data a => Plated (AFunc a)
 
 -- In addition to normal ANF-y things, case arms and continuations of Rec blocks are labelled
 -- with fresh variables (which will become the names of basic blocks in LLVM output)
-data AFunc a = AFunc a Var [(a, Var, Ty)] Ty (ANF a) deriving (THEUSUAL)
 data ANF a
   = AHalt (Atom a)
   | AAlloca a Var Ty (Atom a) (ANF a)
@@ -676,7 +676,8 @@ data ANF a
   | ALoad a Var Ty (Atom a) (APath a) (ANF a) -- e path (GEP+load, extractvalue, extractelement)
   | AStore a (Atom a) (APath a) (Atom a) (ANF a) -- e path <- e; e (GEP+store)
   | AUpdate a Var Ty (Atom a) (APath a) (Atom a) (ANF a) -- e with path = e (insertvalue, insertelement)
-  deriving (THEUSUAL)
+  deriving (THEUSUALA)
+instance Data a => Plated (ANF a)
 
 -- Get names from a function bundle
 bundleNames :: [AFunc a] -> [Var]
@@ -1462,7 +1463,7 @@ instance PP (ANF a) where
 
 -- -------------------- Parsing utils --------------------
 
-newtype PError = PError String deriving (Eq, Ord)
+newtype PError = PError String deriving (THEUSUAL)
 
 data ParserState = ParserState
   { _pNames :: Map String Word -- Name -> internal id
