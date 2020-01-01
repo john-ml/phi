@@ -1122,9 +1122,16 @@ checkBBs graph bbs =
 
 -- -------------------- Code generation --------------------
 
+data GenEnv = GenEnv
+  { _genProto :: ([Ty], Ty) -- Current function's prototype
+  , _genKnown :: Set Var
+  , _genAllocas :: Bool -- Whether or not the current function owns any allocas
+  }
+makeLenses ''GenEnv
+
 type GenM =
   WriterT Doc -- Accumulate global defns
-  (ReaderT (([Ty], Ty), Set Var) -- (Current function's prototype, known functions)
+  (ReaderT GenEnv
   (State Var)) -- Fresh label names
 
 mainLabel :: Doc = "%start"
@@ -1142,7 +1149,9 @@ inst = indent . line'
 anfG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> GenM Doc
 anfG graph bbs = go where
   varG' :: Var -> GenM Doc
-  varG' x = do known <- snd <$> ask; return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
+  varG' x = do
+    known <- _genKnown <$> ask
+    return $ if x ∉ bbs && x ∈ known then gvarG x else varG x
   args xs = do xs' <- mapM atomG xs; return $ "(" <> commaSep xs' <> ")"
   agg a l r xs = do xs' <- mapM atomG xs; return $ pp (a^.typ) <> " " <> l <> commaSep xs' <> r
   atomG = \case
@@ -1184,7 +1193,7 @@ anfG graph bbs = go where
       let t = atomAnno y ^. typ
       alloca <- x .= ("alloca " <> pp t)
       store <- storeG y (varG x)
-      ret e $ alloca <> store
+      local (genAllocas .~ True) . ret e $ alloca <> store
     APrim a x t p xs e -> case p of
       ShuffleVector -> do
         xs' <- commaSep <$> mapM atomG xs
@@ -1212,11 +1221,14 @@ anfG graph bbs = go where
       _ -> do
         xs' <- args xs
         f' <- opG f
-        (ts', t') <- fst <$> ask
+        (ts', t') <- _genProto <$> ask
         let ts = map (\ x -> atomAnno x ^. typ) xs
-        let must = if (ts, t) == (ts', t') then "must" else ""
+        allocas <- _genAllocas <$> ask
+        let
+          must = if (ts, t) == (ts', t') then "must" else ""
+          tail = if allocas then "" else must <> "tail "
         F.fold <$> sequence
-          [ x .= (must <> "tail call " <> pp t <> " " <> f' <> xs')
+          [ x .= (tail <> "call " <> pp t <> " " <> f' <> xs')
           , return . inst $ "ret " <> pp t <> " " <> varG x
           ]
     ACase a x lpes ->
@@ -1244,7 +1256,7 @@ anfG graph bbs = go where
             ]
     ARec a fs l e -> do
       let s = S.fromList (bundleNames fs)
-      (fs', e') <- local (second (s ∪)) $ (,) <$> mapM goAFunc fs <*> go e
+      (fs', e') <- local (genKnown %~ (s ∪)) $ (,) <$> mapM goAFunc fs <*> go e
       return $ F.fold
         [ inst $ "br label " <> varG l
         , F.fold fs'
@@ -1333,21 +1345,27 @@ anfG graph bbs = go where
         e' <- go e
         phis <- zipWithM mkPhi xts actualss'
         return $ f <: (F.fold phis <> e')
-    | otherwise = let ts = map (\ (_, _, t) -> t) axts in local (first $ const (ts, t)) $ do
-        e' <- go e
-        tell $ F.fold
-          [ let axts' = map (\ (_, x, t) -> pp t <> " " <> varG x) axts in
-            line' $ "define " <> pp t <> " " <> gvarG f <> "(" <> commaSep axts' <> ") {"
-          , e'
-          , line' "}"
-          ]
-        return mempty
+    | otherwise =
+        let ts = map (\ (_, _, t) -> t) axts in 
+        local (genAllocas .~ False) . local (genProto .~ (ts, t)) $ do
+          e' <- go e
+          tell $ F.fold
+            [ let axts' = map (\ (_, x, t) -> pp t <> " " <> varG x) axts in
+              line' $ "define " <> pp t <> " " <> gvarG f <> "(" <> commaSep axts' <> ") {"
+            , e'
+            , line' "}"
+            ]
+          return mempty
 
 mainG :: Map String Ty -> Map String [Ty] -> CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
 mainG extEnv structs graph bbs e =
   let
     (body, globals) = runWriterT (anfG graph bbs e)
-      `runReaderT` (([], PTy (I 32)), S.empty)
+      `runReaderT` GenEnv
+        { _genProto = ([], PTy (I 32))
+        , _genKnown = S.empty
+        , _genAllocas = False
+        }
       `evalState` 0
     extDecls = foldMap mkDecl (M.toList extEnv)
   in

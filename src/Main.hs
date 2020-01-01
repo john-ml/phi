@@ -300,9 +300,8 @@ tests = do
     , "    1 => 0,"
     , "    _ => add(xs[0].0, f(xs[0].1))"
     , "  }"
-    -- , "in f(ref(cons{1, ref(cons{2, ref(cons{3, null : *cons})})}))"
-    , "in f(ref(cons{1, ref(cons{2, null : list})}))"
-    ] -- TODO: won't work because tail call + alloca are not friends
+    , "in f(ref(cons{1, ref(cons{2, ref(cons{3, null : *cons})})}))"
+    ]
 
 main = getArgs >>= \case
   ["test"] -> tests
