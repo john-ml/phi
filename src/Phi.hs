@@ -1457,7 +1457,18 @@ instance PP (ANF a) where
 
 newtype PError = PError String deriving (Eq, Ord)
 
-type Parser = ParsecT PError String (State (Map String Word, Map String Ty))
+data ParserState = ParserState
+  { _pNames :: Map String Word -- Name -> internal id
+  , _pExtEnv :: Map String Ty -- Extern name -> type
+  , _pTyAliases :: Map String Ty -- Type aliases
+  , _pTyDefs :: Map String Ty -- Type definitions
+  }
+
+makeLenses ''ParserState
+
+type Parser =
+  ParsecT PError String
+  (State ParserState)
 
 instance P.ShowErrorComponent PError where showErrorComponent (PError s) = s
 
@@ -1508,17 +1519,17 @@ word = do
 varP :: Parser Var
 varP = do
   x <- word
-  (M.!? x) . fst <$> get >>= \case
+  (M.!? x) . _pNames <$> get >>= \case
     Nothing -> do
-      n <- fromIntegral . M.size . fst <$> get
-      modify' (first $ M.insert x n)
+      n <- fromIntegral . M.size . _pNames <$> get
+      modify' $ pNames %~ M.insert x n
       return n
     Just n -> return n
 
 extVarP :: Parser String
 extVarP = do
   x <- word
-  exts <- snd <$> get
+  exts <- _pExtEnv <$> get
   guard $ x `M.member` exts
   return x
 
@@ -1590,7 +1601,7 @@ armP = (:=>) <$> tryAll [Just <$> intP, symbol "_" $> Nothing] <* symbol "=>" <*
 externP :: Parser ()
 externP = do
   xts <- concat <$> many (symbol "extern" >> braces (listOf ((,) <$> word <* symbol ":" <*> tyP)))
-  modify' $ second (M.union (M.fromList xts))
+  modify' $ pExtEnv %~ M.union (M.fromList xts)
 
 expP' :: Bool -> Parser (Exp ParseAnn)
 expP' inGep = do
@@ -1637,10 +1648,11 @@ expP' inGep = do
 expP :: Parser (Exp ParseAnn)
 expP = expP' False
 
-parse' :: String -> String -> (Either String (Exp ParseAnn), (Map String Var, Map String Ty))
-parse' fname s =
-  first (first P.errorBundlePretty)
-    $ P.runParserT (expP <* P.eof) fname s `runState` (M.empty, M.empty)
+parse' :: String -> String -> (Either String (Exp ParseAnn), ParserState)
+parse' fname s = prettyError $ mParse `runState` init where
+  prettyError = first (first P.errorBundlePretty)
+  mParse = P.runParserT (expP <* P.eof) fname s
+  init = ParserState M.empty M.empty M.empty M.empty
 
 parse :: String -> Either String (Exp ParseAnn) = fst . parse' ""
 
@@ -1651,16 +1663,16 @@ parseFile f = fst . parse' f <$> readFile f
 
 compile :: String -> Either String String
 compile s = do
-  let (r, (names, extEnv)) = parse' "" s
+  let (r, pst) = parse' "" s
   e <- ub <$> r
-  e <- runTC (check e (PTy (I 32))) extEnv
+  e <- runTC (check e (PTy (I 32))) (pst^.pExtEnv)
   let anf = annoBV . annoFV . toTails . toANF $ unfoldAggs e
   let graph = graphOf anf
   let bvs = bvsOf anf
   let l = liveness bvs graph anf
   let bbs = inferBBs l
   first show $ checkBBs graph bbs
-  return . runDoc $ mainG extEnv graph bbs anf
+  return . runDoc $ mainG (pst^.pExtEnv) graph bbs anf
 
 compileFile :: FilePath -> IO (Either String String)
 compileFile f = compile <$> readFile f

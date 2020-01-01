@@ -19,7 +19,9 @@ to define a new type.
 
 # Targetting `phi`
 
-## Evaluating away fancy features
+## From statically typed pure FP
+
+### Evaluating away fancy features
 
 - "Higher" stuff (inline):
     - Higher order functions
@@ -94,12 +96,3 @@ let rec f(xs: L, ys: L): L =
 ```
 
 could choose to mutate either `xs` or `ys`.
-
-Maybe this can be done as follows:
-- Want to use region-based memory management (with mini per-region gc if necessary)
-    to allow for sharing and cycles
-- At same time, try to infer which pointers are "Rust-like" i.e. basically are
-    unique/owning pointer to a tree-like data structure where every substructure is
-    also unique
-- Instead of autofreeing when these pointers fall out of scope (region will handle
-    freeing everything), can reuse for new values ==> effectively get mutable update
