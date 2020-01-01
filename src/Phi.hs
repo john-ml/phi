@@ -62,7 +62,8 @@ data Ty
   = Void
   | PTy PTy
   | Arr Word Ty
-  | Tup (Maybe String) [Ty] -- Possibly nominal
+  | Tup (Maybe String) [Ty]
+  -- | TStruct String
   | Vec Word PTy
   | FPtr [Ty] Ty
   deriving (THEUSUAL)
@@ -114,6 +115,7 @@ data Exp a
   -- Aggregates
   | Array a [Exp a]
   | Tuple a (Maybe String) [Exp a]
+  -- Struct a String [Exp a]
   | Vector a [Exp a]
   | Gep a (Exp a) (Path a) -- &e path (GEP)
   | Load a (Exp a) (Path a) -- e path (GEP+load, extractvalue, extractelement)
@@ -121,6 +123,19 @@ data Exp a
   | Update a (Exp a) (Path a) (Exp a) -- e with path = e (insertvalue, insertelement)
   deriving (THEUSUALA)
 instance Data a => Plated (Exp a)
+
+-- For ANF
+data Atom a
+  = AVar a Var
+  | AUndef a
+  | ANull a
+  | AExtVar a String
+  | AInt a Integer Width
+  | AArr a [Atom a]
+  | ATup a (Maybe String) [Atom a]
+  | AVec a [Atom a]
+  deriving (THEUSUALA)
+instance Data a => Plated (Atom a)
 
 -- Since this is LLVM and not λ-calculus, every function must satisfy some conditions
 -- so that they can be implemented as basic blocks using φ-nodes instead of closures.
@@ -345,30 +360,36 @@ instance PP TCErr where
     OutOfBounds n ty -> line' $ "Index " <> show'' n <> " is out of bounds for type " <> pp ty
     Custom s -> line' $ fromString s
 
-type TC =
-  ExceptT (P.SourcePos, TCErr)
-  (Reader (Map Var Ty, Map String Ty)) -- Local + extern typing environmnts
+data TCState = TCState
+  { _tcLocals :: Map Var Ty
+  , _tcExterns :: Map String Ty
+  , _tcStructs :: Map String [Ty]
+  }
+makeLenses ''TCState
+
+type TC = ExceptT (P.SourcePos, TCErr) (Reader TCState)
 
 runTC' :: TC a -> Map Var Ty -> Map String Ty -> Either (P.SourcePos, TCErr) a
-runTC' m env extEnv = runExceptT m `runReader` (env, extEnv)
+runTC' m env extEnv =
+  runExceptT m `runReader` (TCState M.empty M.empty M.empty) {_tcExterns = extEnv}
 
 runTC :: TC a -> Map String Ty -> Either String a
 runTC m extEnv = first pretty $ runTC' m M.empty extEnv where
   pretty (pos, err) = P.sourcePosPretty pos ++ ": " ++ runDoc (pp err)
 
 withBindings :: [Var] -> [Ty] -> TC a -> TC a
-withBindings xs ts = local (first (M.union . M.fromList $ zip xs ts))
+withBindings xs ts = local $ tcLocals %~ M.union (M.fromList $ zip xs ts)
 
 withBinding :: Var -> Ty -> TC a -> TC a
-withBinding x t = local (first $ M.insert x t)
+withBinding x t = local $ tcLocals %~ M.insert x t
 
 tcLookup :: UBAnn -> Var -> TC Ty
-tcLookup a x = (M.!? x) . fst <$> ask >>= \case
+tcLookup a x = (M.!? x) . _tcLocals <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ NotInScope x
 
 extLookup :: UBAnn -> String -> TC Ty
-extLookup a s = (M.!? s) . snd <$> ask >>= \case
+extLookup a s = (M.!? s) . _tcExterns <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ ExtNotInScope s
 
@@ -542,7 +563,7 @@ infer = \case
               (t', ss') <- goPath' (ts `L.genericIndex` n) ss
               return (t', Proj (typ .==. Void .*. a) n : ss')
           | otherwise -> raise a $ OutOfBounds n t
-        t -> raise a $ ExGotShape "tuple" t
+        t -> raise a $ ExGotShape "tuple or struct" t
       Elem e : ss -> case t of
         Vec _ pt -> infer e >>= \case
           (PTy (I _), e') -> do
@@ -628,18 +649,6 @@ unfoldAggs = go where
 
 
 -- -------------------- Conversion to ANF --------------------
-
-data Atom a
-  = AVar a Var
-  | AUndef a
-  | ANull a
-  | AExtVar a String
-  | AInt a Integer Width
-  | AArr a [Atom a]
-  | ATup a (Maybe String) [Atom a]
-  | AVec a [Atom a]
-  deriving (THEUSUALA)
-instance Data a => Plated (Atom a)
 
 newtype APath a = APath [AStep a] deriving (THEUSUALA)
 instance Data a => Plated (APath a)
