@@ -12,7 +12,7 @@ print' x = print (x $> ())
 testTC :: String -> IO ()
 testTC s = either putStrLn print' $ (\ x -> runTC x M.empty M.empty) . infer =<< (ub <$> parse s)
 
-toANF' :: String -> Either String (ANF TyAnn)
+toANF' :: String -> Either String (ANF Anno)
 toANF' s = fmap (toANF . snd) . (\ x -> runTC x M.empty M.empty) . infer =<< (ub <$> parse s)
 
 testANF :: String -> IO ()

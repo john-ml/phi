@@ -31,8 +31,6 @@ import qualified Data.Graph as G
 
 import Util
 
-import Data.HList.CommonMain hiding (Any)
-
 import Data.Data
 import Data.Data.Lens
 import Control.Lens
@@ -175,9 +173,42 @@ instance Data a => Plated (Atom a)
 --   It's impossible for two distinct functions f and f' to call a BB g because both would
 --   have to have killed the same set of variables (violating UB).
 
+-- -------------------- Structure of the compiler --------------------
+
+data Anno = Anno
+  { -- Parsing ==> ASTs are labelled with source locations
+    _loc :: P.SourcePos
+  , -- After parsing, make bindings unique
+    -- After UB, type check and annotate nodes with their types
+    _typ :: Ty
+  , -- After TC, convert to ANF and rewrite tail calls into Tail AST nodes.
+    -- After ANF, label nodes with FV and BV sets...
+    _fvSet :: Set Var
+  , _bvSet :: Set Var
+  } deriving (THEUSUAL)
+makeLenses ''Anno
+
+-- ...compute the call graph...
+data FnCall a = FnCall
+  { isTail :: Bool
+  , callerOf :: Maybe Var -- Nothing ==> main
+  , actualsOf :: [Atom a]
+  , locOf :: P.SourcePos
+  } deriving (THEUSUALA)
+type CallGraph a = Map Var (Set (FnCall a))
+
+-- ...and determine whether each function should be an SSA block or a CFG.
+type BBs = Set Var
+
 -- -------------------- Some boilerplate to work with annotations --------------------
 
-makeLabelable "loc hasUB typ fvSet bvSet hasTail"
+emptyAnno :: Anno
+emptyAnno = Anno
+  { _loc = undefined
+  , _typ = undefined
+  , _fvSet = undefined
+  , _bvSet = undefined
+  }
 
 -- Every expression node has an annotation
 anno :: Exp a -> a
@@ -205,48 +236,6 @@ anno = \case
   Update a _ _ _ -> a
 
 raise a e = throwError (a ^. loc, e)
-
--- -------------------- Structure of the compiler --------------------
-
--- Parsing ==> ASTs are labelled with source locations
-type ParseFields = '[Tagged "loc" P.SourcePos]
-type ParseAnn = Record ParseFields
-
--- After parsing, make bindings unique
-data HasUB = HasUB deriving (THEUSUAL)
-type UBFields = Tagged "hasUB" HasUB : ParseFields
-type UBAnn = Record UBFields
-
--- After UB, type check and annotate nodes with their types
-type TyFields = Tagged "typ" Ty : UBFields
-type TyAnn = Record TyFields
-
--- Once lebelled, every expression node has a type
-typeof :: Exp TyAnn -> Ty
-typeof e = anno e ^. typ
-
--- After TC, convert to ANF and rewrite tail calls into Tail AST nodes.
-data HasTail = HasTail deriving (THEUSUAL)
-type TailFields = Tagged "hasTail" HasTail : TyFields
-type TailAnn = Record TailFields
-
--- After ANF, label nodes with FV and BV sets...
-type FVFields = Tagged "fvSet" (Set Var) : TailFields
-type FVAnn = Record FVFields
-type BVFields = Tagged "bvSet" (Set Var) : FVFields
-type BVAnn = Record BVFields
-
--- ...compute the call graph...
-data FnCall a = FnCall
-  { isTail :: Bool
-  , callerOf :: Maybe Var -- Nothing ==> main
-  , actualsOf :: [Atom a]
-  , locOf :: P.SourcePos
-  } deriving (THEUSUALA)
-type CallGraph a = Map Var (Set (FnCall a))
-
--- ...and determine whether each function should be an SSA block or a CFG.
-type BBs = Set Var
 
 -- -------------------- Variables --------------------
 
@@ -298,10 +287,8 @@ uv :: Exp a -> Set Var
 uv = foldVars S.singleton
 
 -- Rename bound variables for unique bindings
-ub :: Exp ParseAnn -> Exp UBAnn
-ub e = fmap goAnn $ go M.empty e `evalState` maxUsed e where
-  goAnn :: ParseAnn -> UBAnn
-  goAnn a = hasUB .==. HasUB .*. a
+ub :: Exp Anno -> Exp Anno
+ub e = go M.empty e `evalState` maxUsed e where
   go σ = \case
     Var a x -> return $ Var a (σ ! x)
     Undef a -> return $ Undef a
@@ -401,38 +388,38 @@ withBindings xs ts = local $ tcLocals %~ M.union (M.fromList $ zip xs ts)
 withBinding :: Var -> Ty -> TC a -> TC a
 withBinding x t = local $ tcLocals %~ M.insert x t
 
-tcLookup :: UBAnn -> Var -> TC Ty
+tcLookup :: Anno -> Var -> TC Ty
 tcLookup a x = (M.!? x) . _tcLocals <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ NotInScope x
 
-extLookup :: UBAnn -> String -> TC Ty
+extLookup :: Anno -> String -> TC Ty
 extLookup a s = (M.!? s) . _tcExterns <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ ExtNotInScope s
 
-structLookup :: UBAnn -> String -> TC [Ty]
+structLookup :: Anno -> String -> TC [Ty]
 structLookup a s = (M.!? s) . _tcStructs <$> ask >>= \case
   Just r -> return r
   Nothing -> raise a $ StructNotInScope s
 
-check :: Exp UBAnn -> Ty -> TC (Exp TyAnn)
+check :: Exp Anno -> Ty -> TC (Exp Anno)
 check exp ty = case exp of
-  Undef a -> return $ Undef (typ .==. ty .*. a)
+  Undef a -> return $ Undef (typ .~ ty $ a)
   Null a -> case ty of
-    PTy (Ptr ty') -> return $ Null (typ .==. ty .*. a)
+    PTy (Ptr ty') -> return $ Null (typ .~ ty $ a)
     ty -> raise a $ ExGotShape "pointer" ty
   Case a e pes -> infer e >>= \case
     (PTy (I _), e') -> do
       pes' <- mapM (\ (p :=> e) -> (p :=>) <$> check e ty) pes
-      return $ Case (typ .==. ty .*. a) e' pes'
+      return $ Case (typ .~ ty $ a) e' pes'
     (ty, _) -> raise a $ ExGotShape "integer" ty
   exp@(anno -> a) -> infer exp >>= \case
     (ty', exp')
       | ty' == ty -> return exp'
       | otherwise -> raise a $ ExGot ty ty'
 
-checkNumOp :: UBAnn -> [Exp UBAnn] -> TC (Ty, [Exp TyAnn])
+checkNumOp :: Anno -> [Exp Anno] -> TC (Ty, [Exp Anno])
 checkNumOp a = \case
   [] -> raise a . Custom $ "Expected at least one argument"
   (e:es) -> do
@@ -450,7 +437,7 @@ checkNumOp a = \case
       PTy FP128 -> True
       _ -> False
 
-checkCmp :: UBAnn -> [Exp UBAnn] -> (Ty -> Bool) -> TC (Ty, [Exp TyAnn])
+checkCmp :: Anno -> [Exp Anno] -> (Ty -> Bool) -> TC (Ty, [Exp Anno])
 checkCmp a es ok = case es of
   [e1, e2] -> do
     (t, e1') <- infer e1
@@ -458,7 +445,7 @@ checkCmp a es ok = case es of
     e2' <- check e2 t
     return (PTy (I 1), [e1', e2'])
 
-checkPrim :: UBAnn -> [Exp UBAnn] -> Prim -> TC (Ty, [Exp TyAnn])
+checkPrim :: Anno -> [Exp Anno] -> Prim -> TC (Ty, [Exp Anno])
 checkPrim a es = \case
   BinArith _ -> checkNumOp a es
   ICmp _ -> checkCmp a es . fix $ \ go -> \case
@@ -479,57 +466,57 @@ checkPrim a es = \case
         es' <- forM es $ \case
           Int a i 32 -> do
             let ty = PTy (I 32)
-            return $ Int (typ .==. ty .*. a) i 32
+            return $ Int (typ .~ ty $ a) i 32
           (anno -> a) -> raise a $ Custom "shuffle mask must contain i32 constants"
         infer v1 >>= \case
           (t@(Vec _ elt), v1') -> do
             v2' <- check v2 t
             let n = L.genericLength es
-            return (Vec n elt, [v1', v2', Vector (typ .==. Vec n (I 32) .*. a) es'])
+            return (Vec n elt, [v1', v2', Vector (typ .~ Vec n (I 32) $ a) es'])
           (t, _) -> raise (anno v1) $ ExGotShape "vector" t
       (anno -> a) -> raise a $ Custom "shuffle mask must be a vector constant"
     _ -> raise a $ Custom "shufflevector expects 3 arguments: v1, v2, and shuffle mask"
 
-var :: UBAnn -> Var -> TC (Ty, Exp TyAnn)
+var :: Anno -> Var -> TC (Ty, Exp Anno)
 var a x = do
   ty <- tcLookup a x
-  return (ty, Var (typ .==. ty .*. a) x)
+  return (ty, Var (typ .~ ty $ a) x)
 
-extVar :: UBAnn -> String -> TC (Ty, Exp TyAnn)
+extVar :: Anno -> String -> TC (Ty, Exp Anno)
 extVar a s = do
   ty <- extLookup a s
-  return (ty, ExtVar (typ .==. ty .*. a) s)
+  return (ty, ExtVar (typ .~ ty $ a) s)
 
-coercible :: UBAnn -> Ty -> Ty -> TC ()
+coercible :: Anno -> Ty -> Ty -> TC ()
 coercible a = curry $ \case
   (PTy (Ptr _), PTy (Ptr _)) -> return ()
   (old, new) -> raise a $ CantCast old new
 
-infer :: Exp UBAnn -> TC (Ty, Exp TyAnn)
+infer :: Exp Anno -> TC (Ty, Exp Anno)
 infer = \case
   Var a x -> var a x
   ExtVar a s -> extVar a s
   Alloca a e -> do
     (t, e') <- infer e
     let ty = PTy (Ptr t)
-    return (ty, Alloca (typ .==. ty .*. a) e')
-  Int a i w -> let t = PTy (I w) in return (t, Int (typ .==. t .*. a) i w)
+    return (ty, Alloca (typ .~ ty $ a) e')
+  Int a i w -> let t = PTy (I w) in return (t, Int (typ .~ t $ a) i w)
   Ann _ e ty -> (ty, ) <$> check e ty
   Prim a p es -> do
     (t, es') <- checkPrim a es p
-    return (t, Prim (typ .==. t .*. a) p es')
+    return (t, Prim (typ .~ t $ a) p es')
   Cast a e ty -> do
     (old, e') <- infer e
     coercible a old ty
-    return (ty, Cast (typ .==. ty .*. a) e' ty)
+    return (ty, Cast (typ .~ ty $ a) e' ty)
   Let a x t e1 e -> do
     e1' <- check e1 t
     (ty, e') <- withBinding x t (infer e)
-    return (ty, Let (typ .==. ty .*. a) x t e1' e')
+    return (ty, Let (typ .~ ty $ a) x t e1' e')
   Call a e es -> infer e >>= \case
     (FPtr ts t, e') | length ts == length es -> do
       es' <- zipWithM check es ts
-      return (t, Call (typ .==. t .*. a) e' es')
+      return (t, Call (typ .~ t $ a) e' es')
     (FPtr ts _, _) ->
       raise a . Custom $
         "Function expects " ++ show (length ts) ++
@@ -542,32 +529,32 @@ infer = \case
       funcs' <- forM funcs $ \ (Func a f axts t e) -> do
         let xs = map (\ (_, x, _) -> x) axts
         let ts = map (\ (_, _, t) -> t) axts
-        let axts' = map (\ (a, x, t) -> (typ .==. Void .*. a, x, t)) axts
+        let axts' = map (\ (a, x, t) -> (typ .~ Void $ a, x, t)) axts
         current <- ask
         e' <- withBindings xs ts (check e t)
-        return $ Func (typ .==. Void .*. a) f axts' t e'
+        return $ Func (typ .~ Void $ a) f axts' t e'
       (ty, e') <- infer e
-      return (ty, Rec (typ .==. ty .*. a) funcs' e')
+      return (ty, Rec (typ .~ ty $ a) funcs' e')
   -- TODO: empty array
   Array a ((e:es) :∧: (L.genericLength -> n)) -> do
     (t, e') <- infer e
     es' <- mapM (`check` t) es
     let ty = Arr n t
-    return (ty, Array (typ .==. ty .*. a) (e':es'))
+    return (ty, Array (typ .~ ty $ a) (e':es'))
   Tuple a es -> do
     (ts, es') <- unzip <$> mapM infer es
     let ty = Tup ts
-    return (ty, Tuple (typ .==. ty .*. a) es')
+    return (ty, Tuple (typ .~ ty $ a) es')
   Struct a s es -> do
     (ts, es') <- unzip <$> mapM infer es
     let ty = TStruct s
-    return (ty, Struct (typ .==. ty .*. a) s es')
+    return (ty, Struct (typ .~ ty $ a) s es')
   Vector a [] -> raise a $ Custom "Zero-element vectors aren't allowed"
   Vector a ((e:es) :∧: (L.genericLength -> n)) -> infer e >>= \case
     (t@(PTy t'), e') -> do
       es' <- mapM (`check` t) es
       let ty = Vec n t'
-      return (ty, Vector (typ .==. ty .*. a) (e':es'))
+      return (ty, Vector (typ .~ ty $ a) (e':es'))
     (t, _) -> raise a $ ExGotShape "primitive type" t
   Gep a e (Path ss) -> do
     ss' <- okForGep a ss
@@ -575,16 +562,16 @@ infer = \case
       (t@(PTy (Ptr _)), e') -> do
         (t', ss'') <- goPath True t ss'
         let ty = PTy (Ptr t')
-        return (ty, Gep (typ .==. ty .*. a) e' (Path ss''))
+        return (ty, Gep (typ .~ ty $ a) e' (Path ss''))
       (t, anno -> a) -> raise a $ ExGotShape "pointer" t
   Load a e (Path ss) -> infer e >>= \case
     (t@(PTy (Ptr _)), e') -> do
       ss' <- okForGep a ss
       (ty, ss'') <- goPath True t ss'
-      return (ty, Load (typ .==. ty .*. a) e' (Path ss''))
+      return (ty, Load (typ .~ ty $ a) e' (Path ss''))
     (t, e') | isAgg t -> do
       (ty, ss') <- goPath False t ss
-      return (ty, Load (typ .==. ty .*. a) e' (Path ss'))
+      return (ty, Load (typ .~ ty $ a) e' (Path ss'))
     (t, anno -> a) -> raise a $ ExGotShape "one of {pointer, tuple, array, vector}" t
   Store a dst (Path ss) src e -> do
     ss' <- okForGep a ss
@@ -593,13 +580,13 @@ infer = \case
         (t', ss'') <- goPath True t ss'
         src' <- check src t'
         (ty, e') <- infer e
-        return (ty, Store (typ .==. ty .*. a) dst' (Path ss'') src' e')
+        return (ty, Store (typ .~ ty $ a) dst' (Path ss'') src' e')
       (t, anno -> a) -> raise a $ ExGotShape "pointer" t
   Update a e (Path ss) e1 -> infer e >>= \case
     (ty, e') | isAgg ty -> do
       (t, ss') <- goPath False ty ss
       e1' <- check e1 t
-      return (ty, Update (typ .==. ty .*. a) e' (Path ss') e1')
+      return (ty, Update (typ .~ ty $ a) e' (Path ss') e1')
     (t, anno -> a) -> raise a $ ExGotShape "one of {tuple, array, vector}" t
   e -> raise (anno e) $ Custom "Can't infer the type of this expression"
   where
@@ -620,7 +607,7 @@ infer = \case
         Tup ts
           | n < L.genericLength ts -> do
               (t', ss') <- goPath' (ts `L.genericIndex` n) ss
-              return (t', Proj (typ .==. Void .*. a) n : ss')
+              return (t', Proj (typ .~ Void $ a) n : ss')
           | otherwise -> raise a $ OutOfBounds n t
         TStruct s -> do
           ts <- structLookup a s
@@ -637,7 +624,7 @@ infer = \case
         Arr m t'
           | n < m -> do
               (t'', ss') <- goPath' t' ss
-              return (t'', IndexA (typ .==. Void .*. a) n : ss')
+              return (t'', IndexA (typ .~ Void $ a) n : ss')
           | otherwise -> raise a $ OutOfBounds n t
         t -> raise a $ ExGotShape "array" t
       Index e : ss -> case t of
@@ -676,7 +663,7 @@ infer = \case
 --    holes etc. and ensure that `store`s and `ret`s only receive variables or aggregate
 --    constants.
 
-unfoldAggs :: Exp TyAnn -> Exp TyAnn
+unfoldAggs :: Exp Anno -> Exp Anno
 unfoldAggs = go where
   go = transform $ \ exp -> case exp of
     Array{} -> goAgg exp
@@ -752,9 +739,9 @@ instance Data a => Plated (ANF a)
 bundleNames :: [AFunc a] -> [Var]
 bundleNames = map (\ (AFunc _ f _ _ _) -> f)
 
-toANF :: Exp TyAnn -> ANF TyAnn
+toANF :: Exp Anno -> ANF Anno
 toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt x) where
-  go :: Map Var (Atom TyAnn) -> Exp TyAnn -> State (Var, ANF TyAnn -> ANF TyAnn) (Atom TyAnn)
+  go :: Map Var (Atom Anno) -> Exp Anno -> State (Var, ANF Anno -> ANF Anno) (Atom Anno)
   go σ = \case
     Var a x -> return $ M.findWithDefault (AVar a x) x σ
     Undef a -> return $ AUndef a
@@ -845,11 +832,10 @@ toANF e = let (x, (_, k)) = go M.empty e `runState` (maxUsed e, id) in k (AHalt 
 
 -- -------------------- Put tail calls into ATail --------------------
 
-toTails :: ANF TyAnn -> ANF TailAnn
-toTails = fmap (hasTail .==. HasTail .*.) . go where
-  go = transform $ \case
-    ACall a x t f xs (AHalt (AVar _ x')) | x == x' -> ATail a x t f xs
-    e -> e
+toTails :: ANF Anno -> ANF Anno
+toTails = transform $ \case
+  ACall a x t f xs (AHalt (AVar _ x')) | x == x' -> ATail a x t f xs
+  e -> e
 
 -- -------------------- FV Annotation --------------------
 
@@ -889,20 +875,20 @@ aAnno = \case
 
 fvs e = aAnno e ^. fvSet
 
-atomFVs :: Atom FVAnn -> Set Var
+atomFVs :: Atom Anno -> Set Var
 atomFVs x = atomAnno x ^. fvSet
 
 afuncAnno :: AFunc a -> a
 afuncAnno (AFunc a _ _ _ _) = a
 
-afuncFVs :: AFunc FVAnn -> Set Var
+afuncFVs :: AFunc Anno -> Set Var
 afuncFVs f = afuncAnno f ^. fvSet
 
-annoFV :: ANF TailAnn -> ANF FVAnn
+annoFV :: ANF Anno -> ANF Anno
 annoFV = go where
-  set s a = fvSet .==. s .*. a
+  set s a = fvSet .~ s $ a
   names = S.fromList . bundleNames
-  goAtom :: Atom TailAnn -> Atom FVAnn
+  goAtom :: Atom Anno -> Atom Anno
   goAtom = \case
     AVar a x -> AVar (set (S.singleton x) a) x
     AUndef a -> AUndef (set S.empty a)
@@ -913,20 +899,20 @@ annoFV = go where
     ATup a (map goAtom -> xs) -> ATup (set (foldMap atomFVs xs) a) xs
     AStruct a s (map goAtom -> xs) -> AStruct (set (foldMap atomFVs xs) a) s xs
     AVec a (map goAtom -> xs) -> AVec (set (foldMap atomFVs xs) a) xs
-  goAFuncs :: [AFunc TailAnn] -> [AFunc FVAnn]
+  goAFuncs :: [AFunc Anno] -> [AFunc Anno]
   goAFuncs fs = map goAFunc fs where
     funcs = names fs
     goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
       AFunc (set (fvs e S.\\ S.fromList (map (\ (_, x, _) -> x) axts) S.\\ funcs) a) f axts t e
-  goStep :: AStep TailAnn -> AStep FVAnn
+  goStep :: AStep Anno -> AStep Anno
   goStep = \case
     AProj a n -> AProj (set S.empty a) n
     AElem x -> AElem (goAtom x)
     AIndexA a n -> AIndexA (set S.empty a) n
     AIndex x -> AIndex (goAtom x)
-  stepFVs :: AStep FVAnn -> Set Var
+  stepFVs :: AStep Anno -> Set Var
   stepFVs s = aStepAnno s ^. fvSet
-  go :: ANF TailAnn -> ANF FVAnn
+  go :: ANF Anno -> ANF Anno
   go = \case
     AHalt x -> AHalt (goAtom x)
     AAlloca a x t (goAtom -> y) (go -> e) ->
@@ -958,20 +944,20 @@ annoFV = go where
 
 type BVMap = Map Var (Set Var)
 
-bvs :: ANF BVAnn -> Set Var
+bvs :: ANF Anno -> Set Var
 bvs e = aAnno e ^. bvSet
 
-atomBVs :: Atom BVAnn -> Set Var
+atomBVs :: Atom Anno -> Set Var
 atomBVs x = atomAnno x ^. bvSet
 
-afuncBVs :: AFunc BVAnn -> Set Var
+afuncBVs :: AFunc Anno -> Set Var
 afuncBVs f = afuncAnno f ^. bvSet
 
-annoBV :: ANF FVAnn -> ANF BVAnn
+annoBV :: ANF Anno -> ANF Anno
 annoBV = go where
-  set s a = bvSet .==. s .*. a
+  set s a = bvSet .~ s $ a
   names = S.fromList . bundleNames
-  goAtom :: Atom FVAnn -> Atom BVAnn
+  goAtom :: Atom Anno -> Atom Anno
   goAtom = \case
     AVar a x -> AVar (set S.empty a) x
     AUndef a -> AUndef (set S.empty a)
@@ -982,18 +968,18 @@ annoBV = go where
     ATup a (map goAtom -> xs) -> ATup (set S.empty a) xs
     AStruct a s (map goAtom -> xs) -> AStruct (set S.empty a) s xs
     AVec a (map goAtom -> xs) -> AVec (set S.empty a) xs
-  goAFuncs :: [AFunc FVAnn] -> [AFunc BVAnn]
+  goAFuncs :: [AFunc Anno] -> [AFunc Anno]
   goAFuncs fs = map goAFunc fs where
     funcs = names fs
     goAFunc (AFunc a f (map (\ (a, x, t) -> (set S.empty a, x, t)) -> axts) t (go -> e)) =
       AFunc (set (bvs e ∪ S.fromList (map (\ (_, x, _) -> x) axts) ∪ funcs) a) f axts t e
-  goStep :: AStep FVAnn -> AStep BVAnn
+  goStep :: AStep Anno -> AStep Anno
   goStep = \case
     AProj a n -> AProj (set S.empty a) n
     AElem x -> AElem (goAtom x)
     AIndexA a n -> AIndexA (set S.empty a) n
     AIndex x -> AIndex (goAtom x)
-  go :: ANF FVAnn -> ANF BVAnn
+  go :: ANF Anno -> ANF Anno
   go = \case
     AHalt x -> AHalt (goAtom x)
     AAlloca a x t (goAtom -> y) (go -> e) ->
@@ -1020,7 +1006,7 @@ annoBV = go where
       AUpdate (set (S.insert x (bvs e)) a) x t y (APath ss) z e
 
 -- Get names of bvs for each function/label
-bvsOf :: ANF BVAnn -> BVMap
+bvsOf :: ANF Anno -> BVMap
 bvsOf = go M.empty where
   go m = \case
     AHalt _ -> m
@@ -1039,7 +1025,7 @@ bvsOf = go M.empty where
 
 -- -------------------- Call graph construction --------------------
 
-graphOf :: ANF BVAnn -> CallGraph BVAnn
+graphOf :: ANF Anno -> CallGraph Anno
 graphOf = go Nothing where
   union = M.unionWith (∪)
   gather = foldr union M.empty
@@ -1076,7 +1062,7 @@ graphOf = go Nothing where
 type Liveness = Map Var (Set Var)
 
 -- Initially, liveness contains all free variables at every label
-initLive :: ANF BVAnn -> Liveness
+initLive :: ANF Anno -> Liveness
 initLive = go where
   go = \case
     AHalt _ -> M.empty
@@ -1093,7 +1079,7 @@ initLive = go where
     AStore _ _ _ _ e -> go e
     AUpdate _ _ _ _ _ _ e -> go e
 
-liveness :: BVMap -> CallGraph BVAnn -> ANF BVAnn -> Liveness
+liveness :: BVMap -> CallGraph Anno -> ANF Anno -> Liveness
 liveness bvs graph e = leastFlowAnno flow adjList (initLive e) where
   flow gen x = gen S.\\ (bvs !! x)
   adjList =
@@ -1114,7 +1100,7 @@ instance Show BBErr where
   show (NotTail pos) = P.sourcePosPretty pos ++ ": " ++ msg where
     msg = "this function belongs in a basic block and can only be called in tail position"
 
-checkBBs :: CallGraph BVAnn -> BBs -> Either BBErr ()
+checkBBs :: CallGraph Anno -> BBs -> Either BBErr ()
 checkBBs graph bbs =
   forM_ bbs $ \ x ->
     forM_ (graph !! x) $ \ FnCall{isTail, locOf} ->
@@ -1146,7 +1132,7 @@ gvarG x = "@f" <> show'' x
 inst :: Doc -> Doc
 inst = indent . line' 
 
-anfG :: CallGraph BVAnn -> BBs -> ANF BVAnn -> GenM Doc
+anfG :: CallGraph Anno -> BBs -> ANF Anno -> GenM Doc
 anfG graph bbs = go where
   varG' :: Var -> GenM Doc
   varG' x = do
@@ -1179,12 +1165,12 @@ anfG graph bbs = go where
     , body
     ]
   ret e line = (line <>) <$> go e
-  storeG :: Atom BVAnn -> Doc -> GenM Doc
+  storeG :: Atom Anno -> Doc -> GenM Doc
   storeG s p = do
     s' <- atomG s
     let ty = PTy (Ptr (atomAnno s ^. typ))
     return . inst $ "store " <> s' <> ", " <> pp ty <> " " <> p
-  go :: ANF BVAnn -> GenM Doc
+  go :: ANF Anno -> GenM Doc
   go = \case
     AHalt x -> inst . ("ret " <>) <$> atomG x
     AAlloca a x pt y e -> do
@@ -1328,10 +1314,10 @@ anfG graph bbs = go where
   goAFunc (AFunc a f axts t e)
     | f ∈ bbs = do
         let
-          calls :: [FnCall BVAnn] = S.toList $ graph !! f
+          calls :: [FnCall Anno] = S.toList $ graph !! f
           callers = callerOf <$> calls
           actualss = actualsOf <$> calls
-          actualss' :: [[(Maybe Var, Atom BVAnn)]] =
+          actualss' :: [[(Maybe Var, Atom Anno)]] =
             L.transpose (zipWith (\ caller actuals -> (caller,) <$> actuals) callers actualss)
           xts :: [(Var, Ty)] = map (\ (_, x, t) -> (x, t)) axts
           mkPhi (x, t) actuals = do
@@ -1357,7 +1343,7 @@ anfG graph bbs = go where
             ]
           return mempty
 
-mainG :: Map String Ty -> Map String [Ty] -> CallGraph BVAnn -> BBs -> ANF BVAnn -> Doc
+mainG :: Map String Ty -> Map String [Ty] -> CallGraph Anno -> BBs -> ANF Anno -> Doc
 mainG extEnv structs graph bbs e =
   let
     (body, globals) = runWriterT (anfG graph bbs e)
@@ -1698,9 +1684,9 @@ primP = tryAll
   , symbol "shufflevector" $> ShuffleVector
   ]
 
-locP :: Parser ParseAnn = (\ pos -> loc .==. pos .*. emptyRecord) <$> P.getSourcePos
+locP :: Parser Anno = (\ pos -> loc .~ pos $ emptyAnno) <$> P.getSourcePos
 
-stepP :: Parser (Step ParseAnn)
+stepP :: Parser (Step Anno)
 stepP = do
   loc <- locP
   tryAll
@@ -1712,9 +1698,9 @@ stepP = do
         ] <* symbol "]"
     ]
 
-pathP :: Parser (Path ParseAnn) = Path <$> some stepP
+pathP :: Parser (Path Anno) = Path <$> some stepP
 
-funcP :: Parser (Func ParseAnn)
+funcP :: Parser (Func Anno)
 funcP =
   Func
     <$> locP <*> varP <*> tupleOf argP <* symbol ":" <*> tyP <* symbol "="
@@ -1722,7 +1708,7 @@ funcP =
   where
     argP = (,,) <$> locP <*> varP <* symbol ":" <*> tyP
 
-armP :: Parser (Arm ParseAnn)
+armP :: Parser (Arm Anno)
 armP = (:=>) <$> tryAll [Just <$> intP, symbol "_" $> Nothing] <* symbol "=>" <*> expP
 
 externP :: Parser ()
@@ -1740,7 +1726,7 @@ structP = do
   (x, ts) <- symbol "struct" >> (,) <$> word <*> braces (listOf tyP)
   modify' $ pStructs %~ M.insert x ts
 
-expP' :: Bool -> Parser (Exp ParseAnn)
+expP' :: Bool -> Parser (Exp Anno)
 expP' inGep = do
   many $ tryAll [externP, aliasP, structP]
   loc <- locP
@@ -1787,18 +1773,18 @@ expP' inGep = do
     , pure e
     ]
 
-expP :: Parser (Exp ParseAnn)
+expP :: Parser (Exp Anno)
 expP = expP' False
 
-parse' :: String -> String -> (Either String (Exp ParseAnn), ParserState)
+parse' :: String -> String -> (Either String (Exp Anno), ParserState)
 parse' fname s = prettyError $ mParse `runState` init where
   prettyError = first (first P.errorBundlePretty)
   mParse = P.runParserT (expP <* P.eof) fname s
   init = ParserState M.empty M.empty M.empty M.empty
 
-parse :: String -> Either String (Exp ParseAnn) = fst . parse' ""
+parse :: String -> Either String (Exp Anno) = fst . parse' ""
 
-parseFile :: FilePath -> IO (Either String (Exp ParseAnn))
+parseFile :: FilePath -> IO (Either String (Exp Anno))
 parseFile f = fst . parse' f <$> readFile f
 
 -- -------------------- Full compilation --------------------
